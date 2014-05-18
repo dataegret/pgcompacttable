@@ -1,0 +1,191 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use DBI;
+
+use Data::Dumper;
+
+my $option_hash;
+
+select(STDOUT);
+our $_log = select();
+our $_log_level;
+our $_dbh;
+
+my $help;
+my $man;
+
+my $db_host = 'localhost';
+my $db_port = 5432;
+my $db_user = $ENV{LOGNAME} || $ENV{USER} || getpwuid($<);
+my $db_passwd = '';
+
+my $db_name = $ENV{LOGNAME} || $ENV{USER} || getpwuid($<);
+my $schema_name = 'public';
+my $table_name;
+
+my $verbosity = 'notice';
+
+#logs
+
+our %log_levels = (
+  'quiet' => 0,
+  'notice' => 1,
+  'verbose' => 2
+);
+
+sub logger {
+  my $level = shift;
+  my $message = shift;
+  my @message_args = @_;
+
+  no strict;
+  print $_log sprintf("$message\n", @message_args) if (($log_levels{$level} || 1) >= $_log_level);
+  use strict;
+}
+
+sub help {
+  logger('quiet', "This is help");
+  return 1;
+}
+
+sub man {
+  logger('quiet', "This is man");
+  return 1;
+}
+
+#DB procedures
+
+sub _dbh {
+  return $_dbh;
+}
+
+sub db_connect {
+  my $db_name = shift;
+  my $db_host = shift;
+  my $db_port = shift;
+  my $db_user = shift;
+  my $db_password = shift;
+
+  $_dbh = DBI->connect("DBI:Pg:dbname=$db_name;host=$db_host;port=$db_port", $db_user, $db_password,{RaiseError => 0, PrintError => 0, AutoCommit => 1});
+  if($DBI::err) { die "Cannot connect to postgres: $DBI::errstr\n"; }
+
+  return $_dbh;
+}
+
+sub get_ident_size {
+  my $schema_name = shift;
+  my $table_name = shift;
+  
+  my $ident_name = $schema_name.".".$table_name;
+  my $sth = $_dbh->prepare("
+SELECT
+    size,
+    total_size,
+    ceil(size::real / bs) AS page_count,
+    ceil(total_size::real / bs) AS total_page_count
+FROM (
+    SELECT
+        current_setting('block_size')::integer AS bs,
+        pg_catalog.pg_relation_size(quote_ident(?)||'.'||quote_ident(?)) AS size,
+        pg_catalog.pg_total_relation_size(quote_ident(?)||'.'||quote_ident(?)) AS total_size
+) AS sq
+");
+
+  $sth->execute($schema_name, $table_name, $schema_name, $table_name);
+
+
+  my $result = $sth->fetchrow_hashref;
+  
+  if (! $result || ref $result ne 'HASH') {
+    die("Cannot get size statistics for table $ident_name.\n");
+  }
+
+  return $result;
+}
+
+sub try_advisory_lock {
+  #my $dbh = shift;
+  my $schema_name = shift;
+  my $table_name = shift;
+ 
+  my $sth = $_dbh->prepare("
+  SELECT pg_try_advisory_lock(
+    'pg_catalog.pg_class'::regclass::integer,
+    (quote_ident(?)||'.'||quote_ident(?))::regclass::integer)::integer;
+    ");
+  $sth->execute($schema_name, $table_name);
+  my ($lock) = $sth->fetchrow_array;
+
+  logger('notice', "Skipping processing: another instance is working with %s.%s", $schema_name, $table_name) unless ($lock); 
+  
+  return $lock;
+}
+
+sub vacuum {
+  #my $dbh = shift;
+  my $schema_name = shift;
+  my $table_name = shift;
+  my $analyze = shift; 
+  
+
+  my $sth = $_dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : '')."(quote_ident(?)||'.'||quote_ident(?)", undef, $schema_name, $table_name);
+
+  return;
+}
+
+#Main code
+
+GetOptions( 
+            #help & man
+            'help|?' => \$help,
+            'm|man' => \$man,
+
+            #database connection parameters
+            'h|host=s' => \$db_host,
+            'p|port=i' => \$db_port,
+            'U|user=s' => \$db_user,
+            'W|password=s' => \$db_passwd,
+            'd=s' => \$db_name,
+            'n|schema=s' => \$schema_name,
+            't|table=s' => \$table_name,
+            'v|verbosity=s' => \$verbosity, 
+          );
+
+$_log_level = $log_levels{$verbosity} || 1; 
+
+help && exit(1) if $help;
+man && exit(1) if $man;
+
+die "Cannot run without table name\n" unless ($table_name);
+
+db_connect($db_name, $db_host, $db_port, $db_user, $db_passwd);
+
+my $stats = get_ident_size($schema_name, $table_name); 
+
+my $locked = try_advisory_lock($schema_name, $table_name);
+
+my $base_stats;
+$base_stats = $stats unless ($base_stats);
+my $empty_table;
+
+if ($locked) {
+  my $vacuum_time = time;
+  vacuum($schema_name, $table_name);
+  $vacuum_time = time - $vacuum_time;
+  $stats = get_ident_size($schema_name, $table_name);
+
+  logger('quiet', "Vacuum initial: %d pages left, duration %.3f seconds.", $stats->{page_count}, $vacuum_time);
+
+  if($stats->{page_count} <= 1) {
+    logger('quiet', "Skipping processing: empty or 1 page table.");
+    $empty_table = 1;
+  }
+}
+
+print "Alles\n";
+
+1;
