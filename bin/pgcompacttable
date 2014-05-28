@@ -29,6 +29,8 @@ my $table_name;
 
 my $verbosity = 'notice';
 
+my $force;
+
 #logs
 
 our %log_levels = (
@@ -235,7 +237,8 @@ GetOptions(
             'd=s' => \$db_name,
             'n|schema=s' => \$schema_name,
             't|table=s' => \$table_name,
-            'v|verbosity=s' => \$verbosity, 
+            'v|verbosity=s' => \$verbosity,
+            'f|force' => \$force,
           );
 
 $_log_level = $log_levels{$verbosity} || 1; 
@@ -253,7 +256,7 @@ my $locked = try_advisory_lock($schema_name, $table_name);
 
 my $base_stats;
 $base_stats = $stats unless ($base_stats);
-my $empty_table;
+my $skip;
 
 if ($locked) {
   my $vacuum_time = time;
@@ -265,11 +268,11 @@ if ($locked) {
 
   if($stats->{page_count} <= 1) {
     logger('quiet', "Skipping processing: empty or 1 page table.");
-    $empty_table = 1;
+    die;
   }
 }
 
-if ($locked && !$empty_table) {
+if ($locked) {
   my $get_stat_time = time;
   my $bloat_statistics = get_bloat_statistics($schema_name, $table_name);
   $get_stat_time = time - $get_stat_time;
@@ -310,6 +313,17 @@ if ($locked && !$empty_table) {
     logger('quiet','Can not process: "always" or "replica" triggers are on.');
     die;
   }
+
+  if(!$force) {      
+    if($stats->{page_count} < 2) {
+      logger('quiet',"Skipping processing: %d pages from 2 pages minimum required.'", $stats->{page_count});
+      die;
+    }
+    if($stats->{free_percent} <= 20) {
+      logger('quiet',"'Skipping processing: %d% space to compact from 20% minimum required.",$stats->{free_percent});
+      die;
+  }
+
 }
 
 print "Alles\n";
