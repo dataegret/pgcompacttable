@@ -57,6 +57,20 @@ sub man {
   return 1;
 }
 
+sub nice_size
+{
+  my $size = shift;
+  my @sizes=qw( B KB MB GB TB PB);
+
+  my $i = 0;
+
+  while ($size > 1024) {
+    $size = $size / 1024;
+    $i++;
+  }
+  return sprintf("%.3f$sizes[$i]", $size);
+}
+
 #DB procedures
 
 sub _dbh {
@@ -81,7 +95,7 @@ sub get_ident_size {
   my $table_name = shift;
   
   my $ident_name = $schema_name.".".$table_name;
-  my $sth = $_dbh->prepare("
+  my $sth = _dbh->prepare("
 SELECT
     size,
     total_size,
@@ -107,12 +121,73 @@ FROM (
   return $result;
 }
 
+sub get_bloat_statistics {
+  my $schema_name = shift;
+  my $table_name = shift;
+
+  my $ident_name = $schema_name.".".$table_name;
+ 
+  my $sth = _dbh->prepare("
+    SELECT nspname FROM pg_catalog.pg_proc
+      JOIN pg_catalog.pg_namespace AS n ON pronamespace = n.oid
+      WHERE proname = 'pgstattuple' LIMIT 1");
+  $sth->execute();
+  my ($pgstattuple_schema_name) = $sth->fetchrow_array;
+ 
+  return undef unless($pgstattuple_schema_name);
+
+  $sth = _dbh->prepare("SELECT
+    ceil((size - free_space) * 100 / fillfactor / bs) AS effective_page_count,
+    round(
+        (100 * (1 - (100 - free_percent) / fillfactor))::numeric, 2
+    ) AS free_percent,
+    ceil(size - (size - free_space) * 100 / fillfactor) AS free_space
+    FROM (
+    SELECT
+        current_setting('block_size')::integer AS bs,
+        pg_catalog.pg_relation_size(pg_catalog.pg_class.oid) AS size,
+        coalesce(
+            (
+                SELECT (
+                    regexp_matches(
+                        reloptions::text, E'.*fillfactor=(\\\\d+).*'))[1]),
+            '100')::real AS fillfactor,
+        pgst.*
+    FROM pg_catalog.pg_class
+    CROSS JOIN
+        $pgstattuple_schema_name.pgstattuple(
+            '$ident_name') AS pgst
+    WHERE pg_catalog.pg_class.oid = '$ident_name'::regclass
+    ) AS sq");
+  $sth->execute;
+
+ my $result = $sth->fetchrow_hashref;
+
+ return $result;
+}
+
+sub has_triggers {
+  my $schema_name = shift;
+  my $table_name = shift;
+
+  my $ident_name = $schema_name.".".$table_name;
+
+  my $sth = _dbh->prepare("SELECT count(1) FROM pg_catalog.pg_trigger
+  WHERE
+      tgrelid = '$ident_name'::regclass AND
+      tgenabled IN ('A', 'R') AND
+      (tgtype & 16)::boolean");
+  $sth->execute;
+  my ($result) = $sth->fetchrow_array;
+
+  return $result;
+}
+
 sub try_advisory_lock {
-  #my $dbh = shift;
   my $schema_name = shift;
   my $table_name = shift;
  
-  my $sth = $_dbh->prepare("
+  my $sth = _dbh->prepare("
   SELECT pg_try_advisory_lock(
     'pg_catalog.pg_class'::regclass::integer,
     (quote_ident(?)||'.'||quote_ident(?))::regclass::integer)::integer;
@@ -126,14 +201,22 @@ sub try_advisory_lock {
 }
 
 sub vacuum {
-  #my $dbh = shift;
   my $schema_name = shift;
   my $table_name = shift;
   my $analyze = shift; 
   
 
-  my $sth = $_dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : '')."(quote_ident(?)||'.'||quote_ident(?)", undef, $schema_name, $table_name);
+  my $sth = _dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : '')."(quote_ident(?)||'.'||quote_ident(?)", undef, $schema_name, $table_name);
 
+  return;
+}
+
+sub analyze {
+  my $schema_name = shift;
+  my $table_name = shift;
+
+  my $sth = $_dbh->do('ANALYZE (quote_ident(?)||'.'||quote_ident(?)', undef, $schema_name, $table_name);
+  
   return;
 }
 
@@ -183,6 +266,49 @@ if ($locked) {
   if($stats->{page_count} <= 1) {
     logger('quiet', "Skipping processing: empty or 1 page table.");
     $empty_table = 1;
+  }
+}
+
+if ($locked && !$empty_table) {
+  my $get_stat_time = time;
+  my $bloat_statistics = get_bloat_statistics($schema_name, $table_name);
+  $get_stat_time = time - $get_stat_time;
+  if ($bloat_statistics->{effective_page_count}) {
+    logger('quiet',"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time)
+  } else {
+    my $analyze_time = time;
+    analyze($schema_name, $table_name);
+    $analyze_time = time - $analyze_time;
+    logger('quiet', "Analyze required initial: duration %.3f second.", $analyze_time);
+    $get_stat_time = time;
+    $bloat_statistics = get_bloat_statistics($schema_name, $table_name);
+    $get_stat_time = time - $get_stat_time;
+    if ($bloat_statistics->{effective_page_count}) {
+      logger('quiet',"message => ('Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time)
+    } else {
+      die "Can not get bloat statistics, processing stopped.";
+    }
+  }
+  
+  my $can_be_compacted = ($bloat_statistics->{'free_percent'} > 0 && ($stats->{page_count} > $bloat_statistics->{effective_page_count}));
+  if ($can_be_compacted) {
+    logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes) , approximately %0.3f% (%d pages) can be compacted reducing the size by %s.",
+      $stats->{page_count},
+      $stats->{total_page_count},
+      $bloat_statistics->{'free_percent'},
+      ($stats->{page_count} > $bloat_statistics->{effective_page_count}),
+      nice_size($bloat_statistics->{free_space})
+    );
+  } else {
+    logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes)",
+      $stats->{page_count},
+      $stats->{total_page_count}
+    );
+  }
+
+  if(has_triggers($schema_name, $table_name)) {
+    logger('quiet','Can not process: "always" or "replica" triggers are on.');
+    die;
   }
 }
 
