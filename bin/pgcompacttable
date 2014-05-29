@@ -3,6 +3,7 @@
 use strict;
 use warnings;
 
+use POSIX;
 use Getopt::Long;
 use DBI;
 
@@ -11,9 +12,18 @@ use Data::Dumper;
 my $option_hash;
 
 select(STDOUT);
+
 our $_log = select();
 our $_log_level;
 our $_dbh;
+
+use constant MINIMAL_COMPACT_PAGES => 2;
+use constant MINIMAL_COMPACT_PERCENT => 20;
+use constant PAGES_PER_ROUND_DIVISOR => 1000;
+use constant MAX_PAGES_PER_ROUND => 5;
+use constant PAGES_BEFORE_VACUUM_LOWER_DIVISOR => 16;
+use constant PAGES_BEFORE_VACUUM_LOWER_THRESHOLD => 1000;
+use constant PAGES_BEFORE_VACUUM_UPPER_DIVISOR => 50;
 
 my $help;
 my $man;
@@ -123,7 +133,7 @@ FROM (
   return $result;
 }
 
-sub get_bloat_statistics {
+sub get_bloat_stats {
   my $schema_name = shift;
   my $table_name = shift;
 
@@ -166,6 +176,81 @@ sub get_bloat_statistics {
  my $result = $sth->fetchrow_hashref;
 
  return $result;
+}
+
+sub get_update_column {
+  my $schema_name = shift;
+  my $table_name = shift;
+
+  my $ident_name = $schema_name.".".$table_name;
+
+  my $sth = _dbh->prepare("SELECT quote_ident(attname)
+    FROM pg_catalog.pg_attribute
+    WHERE
+    attnum > 0 AND -- neither system
+    NOT attisdropped AND -- nor dropped
+    attrelid = '$ident_name'::regclass
+    ORDER BY
+    -- Variable legth attributes have lower priority because of the chance
+    -- of being toasted
+    (attlen = -1),
+    -- Preferably not indexed attributes
+    (
+        attnum::text IN (
+            SELECT regexp_split_to_table(indkey::text, ' ')
+            FROM pg_catalog.pg_index
+            WHERE indrelid = '$ident_name'::regclass)),
+    -- Preferably smaller attributes
+    attlen,
+    attnum
+    LIMIT 1;");
+
+  $sth->execute;
+
+  my ($result) = $sth->fetchrow_array;  
+  return $result;
+}
+
+sub get_pages_per_round {
+  my $page_count = shift;
+  my $to_page = shift;
+
+  my $real_pages_per_round = $page_count / PAGES_PER_ROUND_DIVISOR > 1 ? $page_count / PAGES_PER_ROUND_DIVISOR : 1; 
+  my $pages_per_round = $real_pages_per_round < MAX_PAGES_PER_ROUND ? $real_pages_per_round : MAX_PAGES_PER_ROUND;
+  my $result = ceil($pages_per_round) < $to_page ?  ceil($pages_per_round) : $to_page; 
+
+  return $result;
+}
+
+sub get_pages_before_vacuum {
+  my $page_count = shift;
+  my $expected_page_count = shift;
+
+  my $pages = $page_count / PAGES_BEFORE_VACUUM_LOWER_DIVISOR < PAGES_BEFORE_VACUUM_LOWER_THRESHOLD ? $page_count / PAGES_BEFORE_VACUUM_LOWER_DIVISOR : $page_count / PAGES_BEFORE_VACUUM_LOWER_THRESHOLD;
+  my $result = $pages > $expected_page_count / PAGES_BEFORE_VACUUM_UPPER_DIVISOR ? $pages : $expected_page_count / PAGES_BEFORE_VACUUM_UPPER_DIVISOR;
+
+  return ceil($result);
+}
+
+sub get_max_tupples_per_page {
+  my $schema_name = shift;
+  my $table_name = shift;
+
+  my $ident_name = $schema_name.".".$table_name;
+
+  my $sth = _dbh->prepare("
+          SELECT ceil(current_setting('block_size')::real / sum(attlen))
+          FROM pg_catalog.pg_attribute
+          WHERE
+              attrelid = '$ident_name'::regclass AND
+              attnum < 0;
+              ");
+  $sth->execute;
+  my ($result) = $sth->fetchrow_array; 
+
+  die('Can not get max tupples per page.') unless(defined $result);
+
+  return $result;
 }
 
 sub has_triggers {
@@ -264,7 +349,7 @@ if ($locked) {
   $vacuum_time = time - $vacuum_time;
   $stats = get_ident_size($schema_name, $table_name);
 
-  logger('quiet', "Vacuum initial: %d pages left, duration %.3f seconds.", $stats->{page_count}, $vacuum_time);
+  logger('quiet', "Vacuum initial: %d pages left, duration %.3f seconds.", ($stats->{page_count}||0), $vacuum_time);
 
   if($stats->{page_count} <= 1) {
     logger('quiet', "Skipping processing: empty or 1 page table.");
@@ -274,9 +359,9 @@ if ($locked) {
 
 if ($locked) {
   my $get_stat_time = time;
-  my $bloat_statistics = get_bloat_statistics($schema_name, $table_name);
+  my $bloat_stats = get_bloat_stats($schema_name, $table_name);
   $get_stat_time = time - $get_stat_time;
-  if ($bloat_statistics->{effective_page_count}) {
+  if ($bloat_stats->{effective_page_count}) {
     logger('quiet',"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time)
   } else {
     my $analyze_time = time;
@@ -284,23 +369,23 @@ if ($locked) {
     $analyze_time = time - $analyze_time;
     logger('quiet', "Analyze required initial: duration %.3f second.", $analyze_time);
     $get_stat_time = time;
-    $bloat_statistics = get_bloat_statistics($schema_name, $table_name);
+    $bloat_stats = get_bloat_stats($schema_name, $table_name);
     $get_stat_time = time - $get_stat_time;
-    if ($bloat_statistics->{effective_page_count}) {
+    if ($bloat_stats->{effective_page_count}) {
       logger('quiet',"message => ('Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time)
     } else {
       die "Can not get bloat statistics, processing stopped.";
     }
   }
   
-  my $can_be_compacted = ($bloat_statistics->{'free_percent'} > 0 && ($stats->{page_count} > $bloat_statistics->{effective_page_count}));
+  my $can_be_compacted = ($bloat_stats->{'free_percent'} > 0 && ($stats->{page_count} > $bloat_stats->{effective_page_count}));
   if ($can_be_compacted) {
-    logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes) , approximately %0.3f% (%d pages) can be compacted reducing the size by %s.",
+    logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes) , approximately %0.3f%% (%d pages) can be compacted reducing the size by %s.",
       $stats->{page_count},
       $stats->{total_page_count},
-      $bloat_statistics->{'free_percent'},
-      ($stats->{page_count} > $bloat_statistics->{effective_page_count}),
-      nice_size($bloat_statistics->{free_space})
+      $bloat_stats->{'free_percent'},
+      ($stats->{page_count} > $bloat_stats->{effective_page_count}),
+      nice_size($bloat_stats->{free_space})
     );
   } else {
     logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes)",
@@ -315,15 +400,37 @@ if ($locked) {
   }
 
   if(!$force) {      
-    if($stats->{page_count} < 2) {
+    if($stats->{page_count} < MINIMAL_COMPACT_PAGES) {
       logger('quiet',"Skipping processing: %d pages from 2 pages minimum required.'", $stats->{page_count});
       die;
     }
-    if($stats->{free_percent} <= 20) {
-      logger('quiet',"'Skipping processing: %d% space to compact from 20% minimum required.",$stats->{free_percent});
-      die;
+    if(($bloat_stats->{free_percent}||0) <= MINIMAL_COMPACT_PERCENT) {
+      logger('quiet',"Skipping processing: %d%% space to compact from 20%% minimum required.",($bloat_stats->{free_percent}||0));
+      die Dumper $stats;
+    }
+    logger('quiet', "Processing forced.");
   }
 
+  my $vacuum_page_count = 0;
+  my $initial_size_statistics = %$stats;
+  my $to_page = $stats->{page_count} - 1;
+  my $progress_report_time = time;
+  my $clean_pages_total_duration = 0;
+  my $last_loop = $stats->{page_count} + 1;
+  my $expected_error_occurred = 0;
+
+  my $expected_page_count = $stats->{page_count};
+  my $column_ident = get_update_column($schema_name, $table_name);
+
+  my $pages_per_round = get_pages_per_round($stats->{page_count}, $to_page);
+  my $pages_before_vacuum = get_pages_before_vacuum($stats->{page_count}, $expected_page_count);
+
+  my $max_tupples_per_page = get_max_tupples_per_page($schema_name, $table_name);
+
+  logger('quiet', "Update by column: %s.", $column_ident||'');
+  logger('quiet', "Set pages/round: %d.",  $pages_per_round);
+  logger('quiet', "Set pages/vacuum: %d.", $pages_before_vacuum);
+  
 }
 
 print "Alles\n";
