@@ -25,6 +25,14 @@ use constant PAGES_BEFORE_VACUUM_LOWER_DIVISOR => 16;
 use constant PAGES_BEFORE_VACUUM_LOWER_THRESHOLD => 1000;
 use constant PAGES_BEFORE_VACUUM_UPPER_DIVISOR => 50;
 use constant PROGRESS_REPORT_PERIOD => 60;
+use constant LOCKED_ALTER_TIMEOUT => 1000;
+# Settings & defaults
+
+our %log_levels = (
+  'quiet' => 0,
+  'notice' => 1,
+  'verbose' => 2
+);
 
 my $help;
 my $man;
@@ -39,19 +47,36 @@ my $schema_name = 'public';
 my $table_name;
 
 my $verbosity = 'notice';
-
 my $force;
-
 my $delay_ratio = 0;
-
 my $routine_vacuum;
-#logs
+my $no_reindex;
+my $print_reindex_queries = 0;
+my $max_retry_count = 10;
 
-our %log_levels = (
-  'quiet' => 0,
-  'notice' => 1,
-  'verbose' => 2
-);
+GetOptions(
+            #help & man
+            'help|?' => \$help,
+            'm|man' => \$man,
+
+            #database connection parameters
+            'h|host=s' => \$db_host,
+            'p|port=i' => \$db_port,
+            'U|user=s' => \$db_user,
+            'W|password=s' => \$db_passwd,
+            'd=s' => \$db_name,
+            'n|schema=s' => \$schema_name,
+            't|table=s' => \$table_name,
+            'v|verbosity=s' => \$verbosity,
+            'f|force' => \$force,
+            'no-reindex' => \$no_reindex,
+            'print-reindex-queries' => \$print_reindex_queries,
+            'max-retry-count|i' => \$max_retry_count,
+            #'delay-ratio=i' => \$delay_ratio,
+            #'routine_vacuum' => $routine_vacuum,
+          );
+
+$_log_level = $log_levels{$verbosity} || 1;
 
 sub logger {
   my $level = shift;
@@ -137,22 +162,28 @@ FROM (
   return $result;
 }
 
+sub get_pgstattuple_schema_name {
+  my $sth = _dbh->prepare("
+    SELECT nspname FROM pg_catalog.pg_proc
+      JOIN pg_catalog.pg_namespace AS n ON pronamespace = n.oid
+      WHERE proname = 'pgstattuple' LIMIT 1");
+  $sth->execute();
+  my ($result) = $sth->fetchrow_array;
+
+  return $result;
+}
+
 sub get_bloat_stats {
   my $schema_name = shift;
   my $table_name = shift;
 
   my $ident_name = $schema_name.".".$table_name;
  
-  my $sth = _dbh->prepare("
-    SELECT nspname FROM pg_catalog.pg_proc
-      JOIN pg_catalog.pg_namespace AS n ON pronamespace = n.oid
-      WHERE proname = 'pgstattuple' LIMIT 1");
-  $sth->execute();
-  my ($pgstattuple_schema_name) = $sth->fetchrow_array;
+  my $pgstattuple_schema_name = get_pgstattuple_schema_name;
  
   return undef unless($pgstattuple_schema_name);
 
-  $sth = _dbh->prepare("SELECT
+  my $sth = _dbh->prepare("SELECT
     ceil((size - free_space) * 100 / fillfactor / bs) AS effective_page_count,
     round(
         (100 * (1 - (100 - free_percent) / fillfactor))::numeric, 2
@@ -172,10 +203,10 @@ sub get_bloat_stats {
     FROM pg_catalog.pg_class
     CROSS JOIN
         $pgstattuple_schema_name.pgstattuple(
-            '$ident_name') AS pgst
-    WHERE pg_catalog.pg_class.oid = '$ident_name'::regclass
+            (quote_ident(?) || '.' || quote_ident(?))) AS pgst
+    WHERE pg_catalog.pg_class.oid = (quote_ident(?) || '.' || quote_ident(?))::regclass
     ) AS sq");
-  $sth->execute;
+  $sth->execute($schema_name, $table_name, $schema_name, $table_name);
 
  my $result = $sth->fetchrow_hashref;
 
@@ -186,14 +217,12 @@ sub get_update_column {
   my $schema_name = shift;
   my $table_name = shift;
 
-  my $ident_name = $schema_name.".".$table_name;
-
   my $sth = _dbh->prepare("SELECT quote_ident(attname)
     FROM pg_catalog.pg_attribute
     WHERE
     attnum > 0 AND -- neither system
     NOT attisdropped AND -- nor dropped
-    attrelid = '$ident_name'::regclass
+    attrelid = (quote_ident(?) || '.' || quote_ident(?))::regclass
     ORDER BY
     -- Variable legth attributes have lower priority because of the chance
     -- of being toasted
@@ -203,13 +232,13 @@ sub get_update_column {
         attnum::text IN (
             SELECT regexp_split_to_table(indkey::text, ' ')
             FROM pg_catalog.pg_index
-            WHERE indrelid = '$ident_name'::regclass)),
+            WHERE indrelid = (quote_ident(?) || '.' || quote_ident(?))::regclass)),
     -- Preferably smaller attributes
     attlen,
     attnum
     LIMIT 1;");
 
-  $sth->execute;
+  $sth->execute($schema_name, $table_name, $schema_name, $table_name);
 
   my ($result) = $sth->fetchrow_array;  
   return $result;
@@ -308,6 +337,11 @@ sub analyze {
 
   my $sth = $_dbh->do('ANALYZE (quote_ident(?)||'.'||quote_ident(?)', undef, $schema_name, $table_name);
   
+  return;
+}
+
+sub set_session_replication_role {
+  my $sth = $_dbh->do('set session_replication_role to replica;');
   return;
 }
 
@@ -415,38 +449,469 @@ sub clean_pages {
   my $sth = _dbh->prepare("
     SELECT public.pgcompact_clean_pages_$$(?,?,?,?,?)
   ");
-  warn "SELECT public.pgcompact_clean_pages_$$($ident_name, $column_name, $to_page,  $pages_per_round, $max_tupples_per_page)";
+  #warn "SELECT public.pgcompact_clean_pages_$$($ident_name, $column_name, $to_page,  $pages_per_round, $max_tupples_per_page)";
   $sth->execute($ident_name, $column_name, $to_page,  $pages_per_round, $max_tupples_per_page);
   
   my ($result) = $sth->fetchrow_array;
 
-warn $result;
-
   return $result;
 }
 
+sub get_index_data_list {
+  my $schema_name = shift;
+  my $table_name = shift;
+
+  my $sth = _dbh->prepare("
+SELECT
+    indexname, tablespace, indexdef,
+    regexp_replace(indexdef, E'.* USING (\\\\w+) .*', E'\\\\1') AS indmethod,
+    conname,
+    CASE
+        WHEN contype = 'p' THEN 'PRIMARY KEY'
+        WHEN contype = 'u' THEN 'UNIQUE'
+        ELSE NULL END AS contypedef,
+    (
+        SELECT
+            bool_and(
+                deptype IN ('n', 'a', 'i') AND
+                NOT (refobjid = indexoid AND deptype = 'n') AND
+                NOT (
+                    objid = indexoid AND deptype = 'i' AND
+                    (version < array[9,1] OR contype NOT IN ('p', 'u'))))
+        FROM pg_catalog.pg_depend
+        LEFT JOIN pg_catalog.pg_constraint ON
+            pg_catalog.pg_constraint.oid = refobjid
+        WHERE
+            (objid = indexoid AND classid = pgclassid) OR
+            (refobjid = indexoid AND refclassid = pgclassid)
+    )::integer AS allowed,
+    pg_catalog.pg_relation_size(indexoid)
+FROM (
+    SELECT
+        indexname, tablespace, indexdef,
+        (
+            quote_ident(schemaname) || '.' ||
+            quote_ident(indexname))::regclass AS indexoid,
+        'pg_catalog.pg_class'::regclass AS pgclassid,
+        string_to_array(
+            regexp_replace(
+                version(), E'.*PostgreSQL (\\\\d+\\\\.\\\\d+).*', E'\\\\1'),
+            '.')::integer[] AS version
+    FROM pg_catalog.pg_indexes
+    WHERE
+        schemaname = ? AND
+        tablename = ?
+) AS sq
+LEFT JOIN pg_catalog.pg_constraint ON
+    conindid = indexoid AND contype IN ('p', 'u')
+ORDER BY 8
+ ");
+  
+  $sth->execute($schema_name, $table_name);
+
+  my @result;
+  while(my $result = $sth->fetchrow_hashref) {
+    push @result, $result;
+  }
+
+  return @result;
+}
+
+sub get_index_size_statistics {
+  my $schema_name = shift;
+  my $index_name = shift;
+
+  my $sth = _dbh->prepare("
+SELECT size, ceil(size / bs) AS page_count
+FROM (
+    SELECT
+        pg_catalog.pg_relation_size((quote_ident(?) || '.' || quote_ident(?))::regclass) AS size,
+        current_setting('block_size')::real AS bs
+) AS sq
+  ");
+
+  $sth->execute($schema_name, $index_name);
+
+  my $result = $sth->fetchrow_hashref;
+  
+  return ($result && ref $result eq 'HASH' && $result->{size} && $result->{page_count} ? $result : undef);
+}
+
+sub get_reindex_query {
+  my $index_data = shift;  
+
+  my $sql = $index_data->{data}{definition};
+  $sql =~ s/INDEX (\S+)/INDEX CONCURRENTLY pgcompact_index_$$/;
+  $sql =~ s/( WHERE .*|$)/ TABLESPACE $index_data->{data}{tablespace}$1/ if (defined $index_data->{data}{tablespace});
+
+  return $sql;
+
+}
+
+sub get_alter_index_query {
+  my $schema_name = shift;
+  my $table_name = shift;
+  my $index_data = shift;
+
+  my $constraint_ident = $index_data->{data}{conname} if ($index_data && ref $index_data eq 'HASH' && $index_data->{data} && ref $index_data->{data} eq 'HASH' && $index_data->{data}{conname});
+
+  return
+    "BEGIN; SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . "; 
+    " . ($constraint_ident ?
+      ("ALTER TABLE (quote_ident('$schema_name') || '.' || quote_ident('$table_name'))  DROP CONSTRAINT $constraint_ident;
+ALTER TABLE (quote_ident('$schema_name') || '.' || quote_ident('$table_name')) ADD CONSTRAINT $constraint_ident $index_data->{data}{contypedef} USING INDEX pgcompact_index_$$;") :
+      ("DROP INDEX (quote_ident('$schema_name') || '.' || quote_ident('$index_data->{data}{name}')); ALTER INDEX (quote_ident('$schema_name') || '.pgcompact_index_$$') RENAME TO (quote_ident('$schema_name') || '.' || quote_ident('$index_data->{data}{name}'));")
+    )."END;";
+}
+
+sub get_straight_reindex_query {
+  my $schema_name = shift;
+  my $table_name = shift;
+  my $index_data = shift;
+
+  return "REINDEX INDEX (quote_ident('$schema_name') || . || quote_ident('$index_data->{data}{name}'));";
+}
+
+sub get_index_bloat_statistics {
+  my $schema_name = shift;
+  my $index_name = shift;
+
+  my $pgstattuple_schema_name = get_pgstattuple_schema_name;
+
+  return undef unless($pgstattuple_schema_name);  
+
+  my $sth = _dbh->prepare("
+SELECT
+    CASE
+        WHEN avg_leaf_density = 'NaN' THEN 0
+        ELSE
+            round(
+                (100 * (1 - avg_leaf_density / fillfactor))::numeric, 2
+            )
+        END AS free_percent,
+    CASE
+        WHEN avg_leaf_density = 'NaN' THEN 0
+        ELSE
+            ceil(
+                index_size * (1 - avg_leaf_density / fillfactor)
+            )
+        END AS free_space
+FROM (
+    SELECT
+        coalesce(
+            (
+                SELECT (
+                    regexp_matches(
+                        reloptions::text, E'.*fillfactor=(\\\\d+).*'))[1]),
+            '90')::real AS fillfactor,
+        pgsi.*
+    FROM pg_catalog.pg_class
+    CROSS JOIN $pgstattuple_schema_name.pgstatindex(
+        quite_ident(?) || '.' || quote_ident(?)) AS pgsi
+    WHERE pg_catalog.pg_class.oid = (quite_ident(?) || '.' || quote_ident(?))::regclass
+) AS oq
+  ");
+  $sth->execute($schema_name, $index_name, $schema_name, $index_name);
+
+  my $result = $sth->fetchrow_hashref;
+
+  return ($result && ref $result eq 'HASH' && $result->{'free_percent'} && $result->{'free_space'}) ? $result : undef;
+}
+
+#Process function
+
+sub process {
+  my $attempt = shift;
+  my $stats = get_ident_size($schema_name, $table_name); 
+
+  my $locked = try_advisory_lock($schema_name, $table_name);
+
+  my $base_stats;
+  $base_stats = $stats unless ($base_stats);
+
+  if ($locked) {
+    my $vacuum_time = time;
+    vacuum($schema_name, $table_name);
+    $vacuum_time = time - $vacuum_time;
+    $stats = get_ident_size($schema_name, $table_name);
+
+#  if ($stats->{page_count} > $stats->{page_count}) {
+#    logger('quiet', "Vacuum initial: can not clean %d pages, %d' pages left, duration %d seconds.", ($stats->{page_count} - $stats->{page_count}), $stats->{page_count}, $vacuum_time);
+#  } else {
+      logger('quiet', "Vacuum initial: %d pages left, duration %.3f seconds.", ($stats->{page_count}||0), $vacuum_time);
+#  }
+
+    if($stats->{page_count} <= 1) {
+      logger('quiet', "Skipping processing: empty or 1 page table.");
+      return;
+    }
+  }
+
+  my $bloat_stats;
+
+  if ($locked) {
+    my $get_stat_time = time;
+    $bloat_stats = get_bloat_stats($schema_name, $table_name);
+    
+    $get_stat_time = time - $get_stat_time;
+    if ($bloat_stats->{effective_page_count}) {
+      logger('quiet',"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time);
+    } else {
+      my $analyze_time = time;
+      analyze($schema_name, $table_name);
+      $analyze_time = time - $analyze_time;
+      logger('quiet', "Analyze required initial: duration %.3f second.", $analyze_time);
+      $get_stat_time = time;
+      $bloat_stats = get_bloat_stats($schema_name, $table_name);
+      $get_stat_time = time - $get_stat_time;
+      if ($bloat_stats->{effective_page_count}) {
+        logger('quiet', "Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time)
+      } else {
+        logger('qiuet', "Can not get bloat statistics, processing stopped.");
+        return undef;  
+      }
+    }
+    
+    my $can_be_compacted = ($bloat_stats->{'free_percent'} > 0 && ($stats->{page_count} > $bloat_stats->{effective_page_count}));
+    if ($can_be_compacted) {
+      logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes) , approximately %0.3f%% (%d pages) can be compacted reducing the size by %s.",
+        $stats->{page_count},
+        $stats->{total_page_count},
+        $bloat_stats->{'free_percent'},
+        ($stats->{page_count} > $bloat_stats->{effective_page_count}),
+        nice_size($bloat_stats->{free_space})
+      );
+    } else {
+      logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes)",
+        $stats->{page_count},
+        $stats->{total_page_count}
+      );
+    }
+
+    if(has_triggers($schema_name, $table_name)) {
+      logger('quiet','Can not process: "always" or "replica" triggers are on.');
+      return undef;
+    }
+
+    if(!$force) {      
+      if($stats->{page_count} < MINIMAL_COMPACT_PAGES) {
+        logger('quiet',"Skipping processing: %d pages from 2 pages minimum required.'", $stats->{page_count});
+        return undef;
+      }
+      if(($bloat_stats->{free_percent}||0) <= MINIMAL_COMPACT_PERCENT) {
+        logger('quiet',"Skipping processing: %d%% space to compact from 20%% minimum required.",($bloat_stats->{free_percent}||0));
+        return undef;  
+      }
+      logger('quiet', "Processing forced.");
+    }
+
+    my $is_compacted;
+
+    my $vacuum_page_count = 0;
+    my $initial_size_statistics = %$stats;
+    my $to_page = $stats->{page_count} - 1;
+    my $progress_report_time = time;
+    my $clean_pages_total_duration = 0;
+    my $last_loop = $stats->{page_count} + 1;
+    my $expected_error_occurred = 0;
+
+    my $expected_page_count = $stats->{page_count};
+    my $column_name = get_update_column($schema_name, $table_name);
+
+    my $pages_per_round = get_pages_per_round($stats->{page_count}, $to_page);
+    my $pages_before_vacuum = get_pages_before_vacuum($stats->{page_count}, $expected_page_count);
+
+    my $max_tupples_per_page = get_max_tupples_per_page($schema_name, $table_name);
+
+    logger('quiet', "Update by column: %s.", $column_name||'');
+    logger('quiet', "Set pages/round: %d.",  $pages_per_round);
+    logger('quiet', "Set pages/vacuum: %d.", $pages_before_vacuum);
+
+    my $start_time;
+    my $last_to_page;
+    my $loop;
+    for($loop = $stats->{page_count}; $loop > 0; $loop--) {
+      $start_time = time;
+      _dbh->begin_work;
+      $last_to_page = $to_page;
+
+      eval {
+        $to_page = clean_pages($schema_name, $table_name, $column_name, $last_to_page, $pages_per_round,  $max_tupples_per_page); 
+        $clean_pages_total_duration += (time - $start_time);
+      };
+
+      if ($@) {
+        _dbh->rollback();
+
+        if ($@ =~ 'deadlock detected') {
+          logger('quiet',"Detected deadlock during cleaning.");
+          next;
+        } elsif ($@ =~ 'cannot extract system attribute') {
+          logger('quiet', "System attribute extraction error has occurred, processing stopped.");
+          $expected_error_occurred = 1;
+          last;
+        } else {
+          die($@);
+        }
+      } else {
+        if (defined $to_page) {
+          # Normal cleaning completion
+          if ($to_page == -1) {
+            _dbh->rollback();
+            $to_page = $last_to_page;
+            last;
+          }
+        } else {
+          # Bug trap warning
+          logger('quiet', "Incorrect result of cleaning: column_name %s, to_page %d, pages_per_round %d, max_tupples_per_page %d.",$column_name, $last_to_page, $pages_per_round, $max_tupples_per_page);
+        }
+
+        _dbh->commit();
+      } 
+
+      sleep($delay_ratio * (time - $start_time));
+
+      if (time - $progress_report_time >= PROGRESS_REPORT_PERIOD && $last_to_page != $to_page) {
+        logger('quiet', "Progress: %s %d pages completed.", (defined $bloat_stats->{effective_page_count} ? int(100 * ($to_page ? ($base_stats->{page_count} - $to_page - 1) / ($base_stats->{page_count} - $bloat_stats->{effective_page_count}) : 1) ).'%, ' : ' '), ($base_stats->{page_count} - $to_page - 1));
+        $progress_report_time = time;
+      }
+
+      $expected_page_count -= $pages_per_round;
+      $vacuum_page_count += ($last_to_page - $to_page);
+
+      if ($routine_vacuum && $vacuum_page_count >= $pages_before_vacuum) {
+        my $duration = $clean_pages_total_duration / ($last_loop - $loop);
+        my $average_duration = $duration == 0 ? 0.0001 : $duration;
+        logger('quiet', "Cleaning in average: %.1f pages/second (%.3f seconds per %d pages).", ($pages_per_round / $average_duration), $duration, $pages_per_round);
+        $clean_pages_total_duration = 0;
+        $last_loop = $loop;
+
+        my $vacuum_time = time;
+        vacuum($schema_name, $table_name);
+        $vacuum_time = time - $vacuum_time;
+
+        $stats = get_ident_size($schema_name, $table_name);
+
+        if ($stats->{page_count} > $to_page + 1) {
+          logger('quiet', "Vacuum routine: can not clean %d pages, %d' pages left, duration %d seconds.", ($stats->{page_count} - $to_page - 1), $stats->{page_count}, $vacuum_time);
+        } else {
+          logger('quiet', "Vacuum routine: %d pages left, duration %.3f seconds.", ($stats->{page_count}||0), $vacuum_time);
+        }
+
+        $vacuum_page_count = 0;
+
+        my $last_pages_before_vacuum = $pages_before_vacuum;
+        $pages_before_vacuum = get_pages_before_vacuum($stats->{page_count}, $expected_page_count); 
+        if ($last_pages_before_vacuum != $pages_before_vacuum) {
+          logger('quiet', "Set pages/vacuum: %d.", $pages_before_vacuum);
+        }
+      }
+
+      if ($to_page >= $stats->{page_count}) {
+        $to_page = $stats->{page_count} - 1;
+      }
+
+      if ($to_page <= 1) {
+        $to_page = 0;
+        last;
+      }
+
+      my $last_pages_per_round = $pages_per_round;
+      $pages_per_round = get_pages_per_round($stats->{page_count}, $to_page);
+        
+      if ($last_pages_per_round != $pages_per_round) {
+        logger('quiet', "Set pages/round: %d.",  $pages_per_round); 
+      }
+    }
+
+    if ($loop == 0) {
+      logger('quiet', "Maximum loops reached.");
+    }
+
+    if ($to_page > 0) {
+      my $vacuum_time = time;
+      vacuum($schema_name, $table_name);
+      $vacuum_time = time - $vacuum_time;
+
+      $stats = get_ident_size($schema_name, $table_name);;
+      
+      if ($stats->{page_count} > $to_page + $pages_per_round) {
+        logger('quiet', "Vacuum final: can not clean %d pages, %d pages left, duration %d seconds.", ($stats->{page_count} - $to_page - $pages_per_round), $stats->{page_count}, $vacuum_time);
+      } else {
+        logger('quiet', "Vacuum final: %d pages left, duration %.3f seconds.", ($stats->{page_count}||0), $vacuum_time);
+      }
+    }
+
+    #if (not $self->{'_no_final_analyze'}) {
+    my $analyze_time = time;
+    analyze($schema_name, $table_name);
+    $analyze_time = time - $analyze_time;
+    logger('quiet', "Analyze final: duration %.3f second.", $analyze_time);
+    #}
+
+    $get_stat_time = time;
+    $bloat_stats = get_bloat_stats($schema_name, $table_name);
+    $get_stat_time = time - $get_stat_time;
+    logger('quiet',"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time);
+
+    $pages_before_vacuum = get_pages_before_vacuum($stats->{page_count}, $expected_page_count);
+
+    $is_compacted = (($stats->{page_count} <= $to_page + 1 + $pages_before_vacuum) && !$expected_error_occurred); 
+  }
+
+  my $will_be_skipped;
+  
+  $will_be_skipped = (!$force && ($stats->{page_count} < MINIMAL_COMPACT_PAGES || $bloat_stats->{free_percent} < MINIMAL_COMPACT_PERCENT))  if ($locked);
+
+  my $is_reindexed;
+  if ($locked && ( $attempt == $max_retry_count || $will_be_skipped) && (!$no_reindex || $print_reindex_queries)) {
+    for my $index_data (get_index_data_list($schema_name, $table_name)) {
+      my $initial_index_size_statistics = get_index_size_statistics($schema_name, $index_data->{name});
+
+      if (!$initial_index_size_statistics || ref $initial_index_size_statistics ne 'HASH') {
+        logger('quiet', "DataError Can not get index size statistics.");
+        return;
+      }
+      
+      if ($initial_index_size_statistics->{page_count} <= 1) {
+        logger('quiet', "Skipping reindex: %s.%s, empty or 1 page index.", $schema_name, $index_data->{name});
+        next;
+      }
+      
+      my $index_bloat_statistics;
+      if (! $force) {
+        if ($index_data->{method} ne 'btree') {
+          logger('quiet', "Skipping reindex: %s.%s is a %s index not a btree, reindexing is up to you.", $schema_name, $index_data->{name}, $index_data->{method}); 
+          logger('quiet', "Reindex queries: %s.%s, initial size %d pages (%s)", $schema_name, $index_data->{name}, $initial_index_size_statistics->{page_count}, nice_size($initial_index_size_statistics->{size}));
+          if ($index_data->{data}{allowed}) {
+            logger('quiet', "%s; --%s", get_reindex_query($index_data), $db_name);
+            logger('quiet', "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
+          } else {  
+            logger('quiet', "%s; --%s", get_straight_reindex_query($schema_name, $table_name, $index_data), $db_name);
+          }       
+          next;
+        }
+
+        if ($initial_index_size_statistics->{page_count} < MINIMAL_COMPACT_PAGES) {
+          logger('quiet', "Skipping reindex: %s.%s, %d pages from %d pages minimum required.".$schema_name, $index_data->{name}, $initial_index_size_statistics->{page_count}, MINIMAL_COMPACT_PAGES);
+          next;
+        }
+
+        $index_bloat_statistics = get_index_bloat_statistics($schema_name, $index_data->{data}{name});
+
+        if ($index_bloat_statistics->{'free_percent'} < MINIMAL_COMPACT_PERCENT) {
+          logger('quiet', "Skipping reindex: %s.%s, %d%% space to compact from %d%% minimum required.", $schema_name, $index_data->{name}, $index_bloat_statistics->{free_percent}, MINIMAL_COMPACT_PERCENT);
+          next;
+        }
+      }
+      #---- next stage
+    }
+  }
+
+  return 1;
+}
+
 #Main code
-
-GetOptions( 
-            #help & man
-            'help|?' => \$help,
-            'm|man' => \$man,
-
-            #database connection parameters
-            'h|host=s' => \$db_host,
-            'p|port=i' => \$db_port,
-            'U|user=s' => \$db_user,
-            'W|password=s' => \$db_passwd,
-            'd=s' => \$db_name,
-            'n|schema=s' => \$schema_name,
-            't|table=s' => \$table_name,
-            'v|verbosity=s' => \$verbosity,
-            'f|force' => \$force,
-            #'delay-ratio=i' => \$delay_ratio,
-            #'routine_vacuum' => $routine_vacuum,
-          );
-
-$_log_level = $log_levels{$verbosity} || 1; 
 
 help && exit(1) if $help;
 man && exit(1) if $man;
@@ -454,243 +919,9 @@ man && exit(1) if $man;
 die "Cannot run without table name\n" unless ($table_name);
 
 db_connect($db_name, $db_host, $db_port, $db_user, $db_passwd);
-
+set_session_replication_role;
 create_clean_pages_function;
 
-my $stats = get_ident_size($schema_name, $table_name); 
-
-my $locked = try_advisory_lock($schema_name, $table_name);
-
-my $base_stats;
-$base_stats = $stats unless ($base_stats);
-my $skip;
-
-if ($locked) {
-  my $vacuum_time = time;
-  vacuum($schema_name, $table_name);
-  $vacuum_time = time - $vacuum_time;
-  $stats = get_ident_size($schema_name, $table_name);
-
-#  if ($stats->{page_count} > $stats->{page_count}) {
-#    logger('quiet', "Vacuum initial: can not clean %d pages, %d' pages left, duration %d seconds.", ($stats->{page_count} - $stats->{page_count}), $stats->{page_count}, $vacuum_time);
-#  } else {
-    logger('quiet', "Vacuum initial: %d pages left, duration %.3f seconds.", ($stats->{page_count}||0), $vacuum_time);
-#  }
-
-  if($stats->{page_count} <= 1) {
-    logger('quiet', "Skipping processing: empty or 1 page table.");
-    die;
-  }
-}
-
-if ($locked) {
-  my $get_stat_time = time;
-  my $bloat_stats = get_bloat_stats($schema_name, $table_name);
-  $get_stat_time = time - $get_stat_time;
-  if ($bloat_stats->{effective_page_count}) {
-    logger('quiet',"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time);
-  } else {
-    my $analyze_time = time;
-    analyze($schema_name, $table_name);
-    $analyze_time = time - $analyze_time;
-    logger('quiet', "Analyze required initial: duration %.3f second.", $analyze_time);
-    $get_stat_time = time;
-    $bloat_stats = get_bloat_stats($schema_name, $table_name);
-    $get_stat_time = time - $get_stat_time;
-    if ($bloat_stats->{effective_page_count}) {
-      logger('quiet',"message => ('Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time)
-    } else {
-      die "Can not get bloat statistics, processing stopped.";
-    }
-  }
-  
-  my $can_be_compacted = ($bloat_stats->{'free_percent'} > 0 && ($stats->{page_count} > $bloat_stats->{effective_page_count}));
-  if ($can_be_compacted) {
-    logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes) , approximately %0.3f%% (%d pages) can be compacted reducing the size by %s.",
-      $stats->{page_count},
-      $stats->{total_page_count},
-      $bloat_stats->{'free_percent'},
-      ($stats->{page_count} > $bloat_stats->{effective_page_count}),
-      nice_size($bloat_stats->{free_space})
-    );
-  } else {
-    logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes)",
-      $stats->{page_count},
-      $stats->{total_page_count}
-    );
-  }
-
-  if(has_triggers($schema_name, $table_name)) {
-    logger('quiet','Can not process: "always" or "replica" triggers are on.');
-    die;
-  }
-
-  if(!$force) {      
-    if($stats->{page_count} < MINIMAL_COMPACT_PAGES) {
-      logger('quiet',"Skipping processing: %d pages from 2 pages minimum required.'", $stats->{page_count});
-      die;
-    }
-    if(($bloat_stats->{free_percent}||0) <= MINIMAL_COMPACT_PERCENT) {
-      logger('quiet',"Skipping processing: %d%% space to compact from 20%% minimum required.",($bloat_stats->{free_percent}||0));
-      die Dumper $stats;
-    }
-    logger('quiet', "Processing forced.");
-  }
-
-  my $is_compacted;
-
-  my $vacuum_page_count = 0;
-  my $initial_size_statistics = %$stats;
-  my $to_page = $stats->{page_count} - 1;
-  my $progress_report_time = time;
-  my $clean_pages_total_duration = 0;
-  my $last_loop = $stats->{page_count} + 1;
-  my $expected_error_occurred = 0;
-
-  my $expected_page_count = $stats->{page_count};
-  my $column_name = get_update_column($schema_name, $table_name);
-
-  my $pages_per_round = get_pages_per_round($stats->{page_count}, $to_page);
-  my $pages_before_vacuum = get_pages_before_vacuum($stats->{page_count}, $expected_page_count);
-
-  my $max_tupples_per_page = get_max_tupples_per_page($schema_name, $table_name);
-
-  logger('quiet', "Update by column: %s.", $column_name||'');
-  logger('quiet', "Set pages/round: %d.",  $pages_per_round);
-  logger('quiet', "Set pages/vacuum: %d.", $pages_before_vacuum);
-
-  my $start_time;
-  my $last_to_page;
-  my $loop;
-  for($loop = $stats->{page_count}; $loop > 0; $loop--) {
-    $start_time = time;
-    _dbh->begin_work;
-    $last_to_page = $to_page;
-
-    eval {
-      $to_page = clean_pages($schema_name, $table_name, $column_name, $last_to_page, $pages_per_round,  $max_tupples_per_page); 
-      $clean_pages_total_duration += (time - $start_time);
-    };
-
-    if ($@) {
-      _dbh->rollback();
-
-      if ($@ =~ 'deadlock detected') {
-        logger('quiet',"Detected deadlock during cleaning.");
-        next;
-      } elsif ($@ =~ 'cannot extract system attribute') {
-        logger('quiet', "System attribute extraction error has occurred, processing stopped.");
-        $expected_error_occurred = 1;
-        last;
-      } else {
-        die($@);
-      }
-    } else {
-      if (defined $to_page) {
-        # Normal cleaning completion
-        if ($to_page == -1) {
-          _dbh->rollback();
-          $to_page = $last_to_page;
-          last;
-        }
-      } else {
-        # Bug trap warning
-        logger('quiet', "Incorrect result of cleaning: column_name %s, to_page %d, pages_per_round %d, max_tupples_per_page %d.",$column_name, $last_to_page, $pages_per_round, $max_tupples_per_page);
-      }
-
-      _dbh->commit();
-    } 
-
-    sleep($delay_ratio * (time - $start_time));
-
-    if (time - $progress_report_time >= PROGRESS_REPORT_PERIOD && $last_to_page != $to_page) {
-      logger('quiet', "Progress: %s %d pages completed.", (defined $bloat_stats->{effective_page_count} ? int(100 * ($to_page ? ($base_stats->{page_count} - $to_page - 1) / ($base_stats->{page_count} - $bloat_stats->{effective_page_count}) : 1) ).'%, ' : ' '), ($base_stats->{page_count} - $to_page - 1));
-      $progress_report_time = time;
-    }
-
-    $expected_page_count -= $pages_per_round;
-    $vacuum_page_count += ($last_to_page - $to_page);
-
-    if ($routine_vacuum && $vacuum_page_count >= $pages_before_vacuum) {
-      my $duration = $clean_pages_total_duration / ($last_loop - $loop);
-      my $average_duration = $duration == 0 ? 0.0001 : $duration;
-      logger('quiet', "Cleaning in average: %.1f pages/second (%.3f seconds per %d pages).", ($pages_per_round / $average_duration), $duration, $pages_per_round);
-      $clean_pages_total_duration = 0;
-      $last_loop = $loop;
-
-      my $vacuum_time = time;
-      vacuum($schema_name, $table_name);
-      $vacuum_time = time - $vacuum_time;
-
-      $stats = get_ident_size($schema_name, $table_name);
-
-      if ($stats->{page_count} > $to_page + 1) {
-        logger('quiet', "Vacuum routine: can not clean %d pages, %d' pages left, duration %d seconds.", ($stats->{page_count} - $to_page - 1), $stats->{page_count}, $vacuum_time);
-      } else {
-        logger('quiet', "Vacuum routine: %d pages left, duration %.3f seconds.", ($stats->{page_count}||0), $vacuum_time);
-      }
-
-      $vacuum_page_count = 0;
-
-      my $last_pages_before_vacuum = $pages_before_vacuum;
-      $pages_before_vacuum = get_pages_before_vacuum($stats->{page_count}, $expected_page_count); 
-      if ($last_pages_before_vacuum != $pages_before_vacuum) {
-        logger('quiet', "Set pages/vacuum: %d.", $pages_before_vacuum);
-      }
-    }
-
-    if ($to_page >= $stats->{page_count}) {
-      $to_page = $stats->{page_count} - 1;
-    }
-
-    if ($to_page <= 1) {
-      $to_page = 0;
-      last;
-    }
-
-    my $last_pages_per_round = $pages_per_round;
-    $pages_per_round = get_pages_per_round($stats->{page_count}, $to_page);
-      
-    if ($last_pages_per_round != $pages_per_round) {
-      logger('quiet', "Set pages/round: %d.",  $pages_per_round); 
-    }
-  }
-
-  if ($loop == 0) {
-    logger('quiet', "Maximum loops reached.");
-  }
-
-  if ($to_page > 0) {
-    my $vacuum_time = time;
-    vacuum($schema_name, $table_name);
-    $vacuum_time = time - $vacuum_time;
-
-    $stats = get_ident_size($schema_name, $table_name);;
-    
-    if ($stats->{page_count} > $to_page + $pages_per_round) {
-      logger('quiet', "Vacuum final: can not clean %d pages, %d' pages left, duration %d seconds.", ($stats->{page_count} - $to_page - $pages_per_round), $stats->{page_count}, $vacuum_time);
-    } else {
-      logger('quiet', "Vacuum final: %d pages left, duration %.3f seconds.", ($stats->{page_count}||0), $vacuum_time);
-    }
-  }
-
-  #if (not $self->{'_no_final_analyze'}) {
-  my $analyze_time = time;
-  analyze($schema_name, $table_name);
-  $analyze_time = time - $analyze_time;
-  logger('quiet', "Analyze final: duration %.3f second.", $analyze_time);
-  #}
-
-  $get_stat_time = time;
-  $bloat_stats = get_bloat_stats($schema_name, $table_name);
-  $get_stat_time = time - $get_stat_time;
-  logger('quiet',"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time);
-
-  $pages_before_vacuum = get_pages_before_vacuum($stats->{page_count}, $expected_page_count);
-
-  $is_compacted = (($stats->{page_count} <= $to_page + 1 + $pages_before_vacuum) && !$expected_error_occurred); 
-}
-
-print "Alles\n";
+process(0);
 
 1;
