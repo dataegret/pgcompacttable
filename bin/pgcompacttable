@@ -26,6 +26,7 @@ use constant PAGES_BEFORE_VACUUM_LOWER_THRESHOLD => 1000;
 use constant PAGES_BEFORE_VACUUM_UPPER_DIVISOR => 50;
 use constant PROGRESS_REPORT_PERIOD => 60;
 use constant LOCKED_ALTER_TIMEOUT => 1000;
+use constant LOCKED_ALTER_COUNT => 100;
 # Settings & defaults
 
 our %log_levels = (
@@ -618,6 +619,47 @@ FROM (
   return ($result && ref $result eq 'HASH' && $result->{'free_percent'} && $result->{'free_space'}) ? $result : undef;
 }
 
+sub reindex {
+  my $index_data = shift;
+
+  my $sql = $index_data->{data}{definition};
+  $sql =~ s/INDEX (\S+)/INDEX CONCURRENTLY pgcompact_index_$$/;
+  $sql =~ s/( WHERE .*|$)/ TABLESPACE $index_data->{data}{tablespace}$1/ if (defined $index_data->{data}{tablespace});
+
+  _dbh->do($sql);
+
+  return;
+}
+
+sub alter_index {
+  my $schema_name = shift;
+  my $table_name = shift;
+  my $index_data = shift;
+
+  my $constraint_ident = $index_data->{data}{conname} if ($index_data && ref $index_data eq 'HASH' && $index_data->{data} && ref $index_data->{data} eq 'HASH' && $index_data->{data}{conname});
+
+  my $sql =
+    "BEGIN; SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . "; 
+    " . ($constraint_ident ?
+      ("ALTER TABLE (quote_ident(?) || '.' || quote_ident(?))  DROP CONSTRAINT ?;
+ALTER TABLE (quote_ident('$schema_name') || '.' || quote_ident('$table_name')) ADD CONSTRAINT $constraint_ident $index_data->{data}{contypedef} USING INDEX pgcompact_index_$$;") :
+      ("DROP INDEX (quote_ident('$schema_name') || '.' || quote_ident('$index_data->{data}{name}')); ALTER INDEX (quote_ident('$schema_name') || '.pgcompact_index_$$') RENAME TO (quote_ident('$schema_name') || '.' || quote_ident('$index_data->{data}{name}'));")
+    )."END;";
+  if ($constraint_ident) {
+    _dbh->do("BEGIN; SET LOCAL statement_timeout TO ?; ALTER TABLE (quote_ident(?) || '.' || quote_ident(?))  DROP CONSTRAINT ?; 
+ALTER TABLE (quote_ident(?) || '.' || quote_ident(?)) ADD CONSTRAINT ? ? USING INDEX pgcompact_index_$$; END;", 
+      undef, LOCKED_ALTER_TIMEOUT, $schema_name, $table_name, $constraint_ident, $schema_name, $index_data->{data}{name}, $constraint_ident, $index_data->{data}{contypedef}
+    );  
+  } else {
+    _dbh->do("BEGIN; SET LOCAL statement_timeout TO ?;DROP INDEX (quote_ident(?) || '.' || quote_ident(?));
+ALTER INDEX (quote_ident(?) || '.pgcompact_index_$$') RENAME TO (quote_ident(?) || '.' || quote_ident(?)); END;", 
+      undef, LOCKED_ALTER_TIMEOUT, $schema_name, $index_data->{data}{name}, $schema_name, $schema_name, $index_data->{data}{name}
+    );
+  }
+
+  return;
+}
+
 #Process function
 
 sub process {
@@ -904,8 +946,88 @@ sub process {
           next;
         }
       }
-      #---- next stage
+
+      if (not $index_data->{'allowed'}) {
+        logger('quiet', "Skipping reindex: %s.%s, can not reindex without heavy locks because of its dependencies, reindexing is up to you.", $schema_name, $index_data->{name});
+        logger('quiet', "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
+           ($force ? ' forced' : ''),
+           $schema_name, 
+           $index_data->{name},
+           $initial_index_size_statistics->{page_count},
+           nice_size($initial_index_size_statistics->{size}),
+           $index_bloat_statistics->{free_percent},
+           nice_size($index_bloat_statistics->{free_space})
+        );
+        logger('quiet', "%s; --%s", get_reindex_query($index_data), $db_name);
+        logger('quiet', "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
+
+        next;
+      }
+
+      if (!$no_reindex) {
+        my $reindex_time = time;
+        reindex($index_data);
+        $reindex_time = time - $reindex_time;
+
+        my $locked_alter_attempt = 0;
+        while ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
+          eval {
+            alter_index($index_data);
+            #$reindex_time = 
+            #$duration += $self->{'_database'}->get_duration();
+          };
+          if ($@) {
+            if ($@ =~ ('canceling statement due '.
+                   'to statement timeout'))
+            { 
+              $locked_alter_attempt++;
+              next;
+            } else {
+              logger('quiet', $@);
+              return;
+            }
+          } else {
+            last;
+          }
+        }
+        
+        #if ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
+        #  $self->_log_reindex(
+        #    ident => $index_ident,
+        #    initial_size_statistics => (
+        #      $initial_index_size_statistics),
+        #    size_statistics => $self->_get_index_size_statistics(
+        #      ident => $index_ident),
+        #    duration => $duration,
+        #    locked_alter_attempt => $locked_alter_attempt);
+#
+        #  $is_reindexed =
+        #    (defined $is_reindexed) ? ($is_reindexed and 1) : 1;
+        #} else {
+        #  $self->_drop_temp_index(data => $index_data);
+        #  $duration += $self->{'_database'}->get_duration();
+#
+        #  $self->_log_reindex_locked_alter_didnt_acquire_lock(
+        #    ident => $index_ident,
+        #    initial_size_statistics => (
+        #      $initial_index_size_statistics),
+        #    bloat_statistics => $index_bloat_statistics,
+        #    data => $index_data,
+        #    duration => $duration,
+        #    locked_alter_attempt => $locked_alter_attempt);
+        #  $is_reindexed = 0;
+        #}
+      }
+
+      #if ($self->{'_dry_run'} or $self->{'_print_reindex_queries'}) {
+      #  $self->_log_reindex_queries(
+      #    ident => $index_ident,
+      #    initial_size_statistics => $initial_index_size_statistics,
+      #    bloat_statistics => $index_bloat_statistics,
+      #    data => $index_data);
+      #}
     }
+      #---- next stage
   }
 
   return 1;
