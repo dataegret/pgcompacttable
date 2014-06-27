@@ -132,7 +132,7 @@ sub db_connect {
   return $_dbh;
 }
 
-sub get_ident_size {
+sub get_size_stats {
   my $schema_name = shift;
   my $table_name = shift;
   
@@ -660,22 +660,32 @@ ALTER INDEX (quote_ident(?) || '.pgcompact_index_$$') RENAME TO (quote_ident(?) 
   return;
 }
 
+sub drop_temp_index {
+  my $schema_name = shift;
+
+  _dbh->do("DROP INDEX ?;", undef, "$schema_name.pgcompact_index_$$");
+
+  return;
+}
+
 #Process function
 
 sub process {
   my $attempt = shift;
-  my $stats = get_ident_size($schema_name, $table_name); 
+  
+  my $is_skipped;
+  my $is_locked = try_advisory_lock($schema_name, $table_name) ? 0 : 1;
 
-  my $locked = try_advisory_lock($schema_name, $table_name);
+  my $stats = get_size_stats($schema_name, $table_name); 
 
   my $base_stats;
   $base_stats = $stats unless ($base_stats);
 
-  if ($locked) {
+  if (!$is_locked) {
     my $vacuum_time = time;
     vacuum($schema_name, $table_name);
     $vacuum_time = time - $vacuum_time;
-    $stats = get_ident_size($schema_name, $table_name);
+    $stats = get_size_stats($schema_name, $table_name);
 
 #  if ($stats->{page_count} > $stats->{page_count}) {
 #    logger('quiet', "Vacuum initial: can not clean %d pages, %d' pages left, duration %d seconds.", ($stats->{page_count} - $stats->{page_count}), $stats->{page_count}, $vacuum_time);
@@ -685,13 +695,13 @@ sub process {
 
     if($stats->{page_count} <= 1) {
       logger('quiet', "Skipping processing: empty or 1 page table.");
-      return;
+      $is_skipped = 1;
     }
   }
 
   my $bloat_stats;
 
-  if ($locked) {
+  if (!$is_locked && !$is_skipped) {
     my $get_stat_time = time;
     $bloat_stats = get_bloat_stats($schema_name, $table_name);
     
@@ -710,10 +720,11 @@ sub process {
         logger('quiet', "Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time)
       } else {
         logger('qiuet', "Can not get bloat statistics, processing stopped.");
-        return undef;  
+        $is_skipped = 1;  
       }
     }
-    
+  }
+  if (!$is_locked && !$is_skipped) {
     my $can_be_compacted = ($bloat_stats->{'free_percent'} > 0 && ($stats->{page_count} > $bloat_stats->{effective_page_count}));
     if ($can_be_compacted) {
       logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes) , approximately %0.3f%% (%d pages) can be compacted reducing the size by %s.",
@@ -732,25 +743,28 @@ sub process {
 
     if(has_triggers($schema_name, $table_name)) {
       logger('quiet','Can not process: "always" or "replica" triggers are on.');
-      return undef;
+      $is_skipped = 1;
     }
 
     if(!$force) {      
       if($stats->{page_count} < MINIMAL_COMPACT_PAGES) {
         logger('quiet',"Skipping processing: %d pages from 2 pages minimum required.'", $stats->{page_count});
-        return undef;
+        $is_skipped = 1;
       }
       if(($bloat_stats->{free_percent}||0) <= MINIMAL_COMPACT_PERCENT) {
         logger('quiet',"Skipping processing: %d%% space to compact from 20%% minimum required.",($bloat_stats->{free_percent}||0));
-        return undef;  
+        $is_skipped = 1;  
       }
       logger('quiet', "Processing forced.");
     }
+  }
 
-    my $is_compacted;
-
+  my $is_compacted;
+  
+  if (!$is_locked && !$is_skipped) {
+    logger('quiet', "Processing forced.") if ($force);
     my $vacuum_page_count = 0;
-    my $initial_size_statistics = %$stats;
+    my $initial_index_size_stats = %$stats;
     my $to_page = $stats->{page_count} - 1;
     my $progress_report_time = time;
     my $clean_pages_total_duration = 0;
@@ -832,7 +846,7 @@ sub process {
         vacuum($schema_name, $table_name);
         $vacuum_time = time - $vacuum_time;
 
-        $stats = get_ident_size($schema_name, $table_name);
+        $stats = get_size_stats($schema_name, $table_name);
 
         if ($stats->{page_count} > $to_page + 1) {
           logger('quiet', "Vacuum routine: can not clean %d pages, %d' pages left, duration %d seconds.", ($stats->{page_count} - $to_page - 1), $stats->{page_count}, $vacuum_time);
@@ -875,7 +889,7 @@ sub process {
       vacuum($schema_name, $table_name);
       $vacuum_time = time - $vacuum_time;
 
-      $stats = get_ident_size($schema_name, $table_name);;
+      $stats = get_size_stats($schema_name, $table_name);;
       
       if ($stats->{page_count} > $to_page + $pages_per_round) {
         logger('quiet', "Vacuum final: can not clean %d pages, %d pages left, duration %d seconds.", ($stats->{page_count} - $to_page - $pages_per_round), $stats->{page_count}, $vacuum_time);
@@ -891,7 +905,7 @@ sub process {
     logger('quiet', "Analyze final: duration %.3f second.", $analyze_time);
     #}
 
-    $get_stat_time = time;
+    my $get_stat_time = time;
     $bloat_stats = get_bloat_stats($schema_name, $table_name);
     $get_stat_time = time - $get_stat_time;
     logger('quiet',"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time);
@@ -903,19 +917,20 @@ sub process {
 
   my $will_be_skipped;
   
-  $will_be_skipped = (!$force && ($stats->{page_count} < MINIMAL_COMPACT_PAGES || $bloat_stats->{free_percent} < MINIMAL_COMPACT_PERCENT))  if ($locked);
+  $will_be_skipped = (!$force && ($stats->{page_count} < MINIMAL_COMPACT_PAGES || $bloat_stats->{free_percent} < MINIMAL_COMPACT_PERCENT))  unless ($is_locked);
 
   my $is_reindexed;
-  if ($locked && ( $attempt == $max_retry_count || $will_be_skipped) && (!$no_reindex || $print_reindex_queries)) {
+  
+  if (!$is_locked && ( $is_compacted || $attempt == $max_retry_count || !$is_skipped || $will_be_skipped) && (!$no_reindex || $print_reindex_queries)) {
     for my $index_data (get_index_data_list($schema_name, $table_name)) {
-      my $initial_index_size_statistics = get_index_size_statistics($schema_name, $index_data->{name});
+      my $initial_index_size_stats = get_index_size_statistics($schema_name, $index_data->{name});
 
-      if (!$initial_index_size_statistics || ref $initial_index_size_statistics ne 'HASH') {
+      if (!$initial_index_size_stats || ref $initial_index_size_stats ne 'HASH') {
         logger('quiet', "DataError Can not get index size statistics.");
         return;
       }
       
-      if ($initial_index_size_statistics->{page_count} <= 1) {
+      if ($initial_index_size_stats->{page_count} <= 1) {
         logger('quiet', "Skipping reindex: %s.%s, empty or 1 page index.", $schema_name, $index_data->{name});
         next;
       }
@@ -924,7 +939,7 @@ sub process {
       if (! $force) {
         if ($index_data->{method} ne 'btree') {
           logger('quiet', "Skipping reindex: %s.%s is a %s index not a btree, reindexing is up to you.", $schema_name, $index_data->{name}, $index_data->{method}); 
-          logger('quiet', "Reindex queries: %s.%s, initial size %d pages (%s)", $schema_name, $index_data->{name}, $initial_index_size_statistics->{page_count}, nice_size($initial_index_size_statistics->{size}));
+          logger('quiet', "Reindex queries: %s.%s, initial size %d pages (%s)", $schema_name, $index_data->{name}, $initial_index_size_stats->{page_count}, nice_size($initial_index_size_stats->{size}));
           if ($index_data->{data}{allowed}) {
             logger('quiet', "%s; --%s", get_reindex_query($index_data), $db_name);
             logger('quiet', "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
@@ -934,8 +949,8 @@ sub process {
           next;
         }
 
-        if ($initial_index_size_statistics->{page_count} < MINIMAL_COMPACT_PAGES) {
-          logger('quiet', "Skipping reindex: %s.%s, %d pages from %d pages minimum required.".$schema_name, $index_data->{name}, $initial_index_size_statistics->{page_count}, MINIMAL_COMPACT_PAGES);
+        if ($initial_index_size_stats->{page_count} < MINIMAL_COMPACT_PAGES) {
+          logger('quiet', "Skipping reindex: %s.%s, %d pages from %d pages minimum required.".$schema_name, $index_data->{name}, $initial_index_size_stats->{page_count}, MINIMAL_COMPACT_PAGES);
           next;
         }
 
@@ -953,8 +968,8 @@ sub process {
            ($force ? ' forced' : ''),
            $schema_name, 
            $index_data->{name},
-           $initial_index_size_statistics->{page_count},
-           nice_size($initial_index_size_statistics->{size}),
+           $initial_index_size_stats->{page_count},
+           nice_size($initial_index_size_stats->{size}),
            $index_bloat_statistics->{free_percent},
            nice_size($index_bloat_statistics->{free_space})
         );
@@ -965,16 +980,15 @@ sub process {
       }
 
       if (!$no_reindex) {
-        my $reindex_time = time;
+        my $start_reindex_time = time;
         reindex($index_data);
-        $reindex_time = time - $reindex_time;
+        my $reindex_time = time - $start_reindex_time;
 
         my $locked_alter_attempt = 0;
         while ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
           eval {
             alter_index($index_data);
-            #$reindex_time = 
-            #$duration += $self->{'_database'}->get_duration();
+            $reindex_time = time - $start_reindex_time;
           };
           if ($@) {
             if ($@ =~ ('canceling statement due '.
@@ -991,46 +1005,90 @@ sub process {
           }
         }
         
-        #if ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
-        #  $self->_log_reindex(
-        #    ident => $index_ident,
-        #    initial_size_statistics => (
-        #      $initial_index_size_statistics),
-        #    size_statistics => $self->_get_index_size_statistics(
-        #      ident => $index_ident),
-        #    duration => $duration,
-        #    locked_alter_attempt => $locked_alter_attempt);
-#
-        #  $is_reindexed =
-        #    (defined $is_reindexed) ? ($is_reindexed and 1) : 1;
-        #} else {
-        #  $self->_drop_temp_index(data => $index_data);
-        #  $duration += $self->{'_database'}->get_duration();
-#
-        #  $self->_log_reindex_locked_alter_didnt_acquire_lock(
-        #    ident => $index_ident,
-        #    initial_size_statistics => (
-        #      $initial_index_size_statistics),
-        #    bloat_statistics => $index_bloat_statistics,
-        #    data => $index_data,
-        #    duration => $duration,
-        #    locked_alter_attempt => $locked_alter_attempt);
-        #  $is_reindexed = 0;
-        #}
+        if ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
+            my $new_stats = get_index_size_statistics($schema_name, $table_name); 
+            my $free_percent = 100 * (1 - $new_stats->{size} / $initial_index_size_stats->{size});
+            my $free_space = ($initial_index_size_stats->{size} - $new_stats->{size});
+            logger('quiet', "Reindex%s: %s.%s, initial size %d pages(%d), has been reduced by %d%% (%s), duration %d seconds, attempts %d.",
+              ($force ? " forced" : ""),
+              $schema_name,
+              $table_name,
+              $initial_index_size_stats->{page_count},
+              nice_size($initial_index_size_stats->{size}),
+              int($free_percent),
+              nice_size($free_space),
+              $reindex_time,
+              $locked_alter_attempt
+            );
+                
+          $is_reindexed = (defined $is_reindexed) ? ($is_reindexed and 1) : 1;
+        } else {
+          my $drop_index_time = time;
+          drop_temp_index($schema_name);
+          $reindex_time += time - $drop_index_time;
+          logger('quiet', "Reindex%s: %s.%s, lock has not been acquired, initial size %d pages(%d), , can be reduced by %d%% (%s), duration %d seconds.",
+            ($force ? " forced" : ""),
+            $schema_name,
+            $table_name,
+            $initial_index_size_stats->{page_count},
+            nice_size($initial_index_size_stats->{size}),
+            $bloat_stats->{free_percent},
+            nice_size($bloat_stats->{free_space}),
+            $reindex_time
+          );  
+          $is_reindexed = 0;
+        }
       }
 
-      #if ($self->{'_dry_run'} or $self->{'_print_reindex_queries'}) {
-      #  $self->_log_reindex_queries(
-      #    ident => $index_ident,
-      #    initial_size_statistics => $initial_index_size_statistics,
-      #    bloat_statistics => $index_bloat_statistics,
-      #    data => $index_data);
-      #}
+      if ($print_reindex_queries) {
+        logger('quiet', "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
+           ($force ? ' forced' : ''),
+           $schema_name,
+           $index_data->{name},
+           $initial_index_size_stats->{page_count},
+           nice_size($initial_index_size_stats->{size}),
+           $index_bloat_statistics->{free_percent},
+           nice_size($index_bloat_statistics->{free_space})
+        );
+        logger('quiet', "%s; --%s", get_reindex_query($index_data), $db_name);
+        logger('quiet', "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
+      }
+    }      
+    
+    if (!$no_reindex) {
+      $stats = get_size_stats($schema_name, $table_name);
     }
-      #---- next stage
+  }
+    
+  if (!$is_locked && !($is_skipped && !defined($is_reindexed))) {
+    my $complete = (($is_compacted || $will_be_skipped || $is_skipped) && (defined $is_reindexed ? $is_reindexed : 1));
+    if ($complete) {
+      logger('quiet', "Processing complete.");
+    } else {
+      logger('quiet', "Processing incomplete.");
+    }
+
+    if (defined $bloat_stats->{free_percent} && defined $bloat_stats->{effective_page_count} && $bloat_stats->{free_percent} > 0 && $bloat_stats->{page_count} > $bloat_stats->{effective_page_count} && !$complete) {
+      logger('quiet', "Processing results: %d pages left (%d pages including toasts and indexes), size reduced by %s (%s including toasts and indexes) in total , approximately %d%% (%d pages) that is %s more were expected to be compacted after this attempt.",
+        $stats->{page_count},
+        $stats->{total_page_count},
+        nice_size($base_stats->{size}),
+        nice_size($base_stats->{total_size}),
+        $bloat_stats->{free_percent},
+        $bloat_stats->{page_count} - $bloat_stats->{effective_page_count},
+        nice_size($bloat_stats->{free_space})
+      );
+    } else {
+      logger('quiet', "Processing results: %d pages left (%d pages including toasts and indexes), size reduced by %s (%s including toasts and indexes) in total.",
+        $stats->{page_count},
+        $stats->{total_page_count},
+        nice_size($base_stats->{size}),
+        nice_size($base_stats->{total_size}),
+      );
+    }
   }
 
-  return 1;
+  return ($is_locked || ($is_compacted or $is_skipped or $will_be_skipped) and (defined $is_reindexed ? $is_reindexed : 1));
 }
 
 #Main code
