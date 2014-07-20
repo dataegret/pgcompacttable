@@ -3,6 +3,7 @@
 use strict;
 use warnings;
 
+use Time::HiRes qw/time sleep/;
 use POSIX;
 use Getopt::Long;
 use DBI;
@@ -159,7 +160,7 @@ FROM (
   if (! $result || ref $result ne 'HASH') {
     die("Cannot get size statistics for table $ident_name.\n");
   }
-
+#warn Dumper $result;
   return $result;
 }
 
@@ -210,7 +211,7 @@ sub get_bloat_stats {
   $sth->execute($schema_name, $table_name, $schema_name, $table_name);
 
  my $result = $sth->fetchrow_hashref;
-
+ 
  return $result;
 }
 
@@ -327,7 +328,8 @@ sub vacuum {
   my $analyze = shift; 
   
 
-  my $sth = _dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : '')."(quote_ident(?)||'.'||quote_ident(?)", undef, $schema_name, $table_name);
+  #my $sth = _dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : '')."(quote_ident(?)||'.'||quote_ident(?)", undef, $schema_name, $table_name);
+  my $sth = _dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : '')."$schema_name.$table_name");
 
   return;
 }
@@ -336,8 +338,9 @@ sub analyze {
   my $schema_name = shift;
   my $table_name = shift;
 
-  my $sth = $_dbh->do('ANALYZE (quote_ident(?)||'.'||quote_ident(?)', undef, $schema_name, $table_name);
-  
+  #my $sth = $_dbh->do('ANALYZE (quote_ident(?)||'.'||quote_ident(?)', undef, $schema_name, $table_name);
+  my $sth = $_dbh->do("ANALYZE $schema_name.$table_name");
+
   return;
 }
 
@@ -576,7 +579,8 @@ sub get_straight_reindex_query {
   my $table_name = shift;
   my $index_data = shift;
 
-  return "REINDEX INDEX (quote_ident('$schema_name') || . || quote_ident('$index_data->{indexname}'));";
+  #return "REINDEX INDEX (quote_ident('$schema_name') || . || quote_ident('$index_data->{indexname}'));";
+  return "REINDEX INDEX ('$schema_name.$index_data->{indexname}')";
 }
 
 sub get_index_bloat_stats {
@@ -894,6 +898,7 @@ sub process {
 
       $stats = get_size_stats($schema_name, $table_name);;
       
+      #warn Dumper {(page_count => $stats->{page_count}, to_page => $to_page, pages_before_vacuum => , $pages_before_vacuum, duration => $vacuum_time)};
       if ($stats->{page_count} > $to_page + $pages_per_round) {
         logger('quiet', "Vacuum final: can not clean %d pages, %d pages left, duration %d seconds.", ($stats->{page_count} - $to_page - $pages_per_round), $stats->{page_count}, $vacuum_time);
       } else {
