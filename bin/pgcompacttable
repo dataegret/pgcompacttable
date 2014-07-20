@@ -736,7 +736,7 @@ sub process {
         $stats->{page_count},
         $stats->{total_page_count},
         $bloat_stats->{'free_percent'},
-        ($stats->{page_count} > $bloat_stats->{effective_page_count}),
+        ($stats->{page_count} - $bloat_stats->{effective_page_count}),
         nice_size($bloat_stats->{free_space})
       );
     } else {
