@@ -18,7 +18,7 @@ our $_log = select();
 our $_log_level;
 our $_dbh;
 
-use constant MINIMAL_COMPACT_PAGES => 2;
+use constant MINIMAL_COMPACT_PAGES => 10;
 use constant MINIMAL_COMPACT_PERCENT => 20;
 use constant PAGES_PER_ROUND_DIVISOR => 1000;
 use constant MAX_PAGES_PER_ROUND => 5;
@@ -160,7 +160,7 @@ FROM (
   if (! $result || ref $result ne 'HASH') {
     die("Cannot get size statistics for table $ident_name.\n");
   }
-#warn Dumper $result;
+  
   return $result;
 }
 
@@ -330,7 +330,7 @@ sub vacuum {
 
   #my $sth = _dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : '')."(quote_ident(?)||'.'||quote_ident(?)", undef, $schema_name, $table_name);
   my $sth = _dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : '')."$schema_name.$table_name");
-
+  
   return;
 }
 
@@ -757,11 +757,11 @@ sub process {
 
     if(!$force) {      
       if($stats->{page_count} < MINIMAL_COMPACT_PAGES) {
-        logger('quiet',"Skipping processing: %d pages from 2 pages minimum required.'", $stats->{page_count});
+        logger('quiet',"Skipping processing: %d pages from %d pages minimum required.'", $stats->{page_count}, MINIMAL_COMPACT_PAGES);
         $is_skipped = 1;
       }
       if(($bloat_stats->{free_percent}||0) <= MINIMAL_COMPACT_PERCENT) {
-        logger('quiet',"Skipping processing: %d%% space to compact from 20%% minimum required.",($bloat_stats->{free_percent}||0));
+        logger('quiet',"Skipping processing: %0.2f%% space to compact from 20%% minimum required.",($bloat_stats->{free_percent}||0));
         $is_skipped = 1;  
       }
     }
@@ -794,7 +794,7 @@ sub process {
     my $start_time;
     my $last_to_page;
     my $loop;
-    for($loop = $stats->{page_count}; $loop > 0; $loop--) {
+    for ($loop = $stats->{page_count}; $loop > 0; $loop--) {
       $start_time = time;
       _dbh->begin_work;
       $last_to_page = $to_page;
@@ -893,14 +893,14 @@ sub process {
 
     if ($to_page > 0) {
       my $vacuum_time = time;
+      sleep(1);
       vacuum($schema_name, $table_name);
       $vacuum_time = time - $vacuum_time;
 
-      $stats = get_size_stats($schema_name, $table_name);;
+      $stats = get_size_stats($schema_name, $table_name);
       
-      #warn Dumper {(page_count => $stats->{page_count}, to_page => $to_page, pages_before_vacuum => , $pages_before_vacuum, duration => $vacuum_time)};
       if ($stats->{page_count} > $to_page + $pages_per_round) {
-        logger('quiet', "Vacuum final: can not clean %d pages, %d pages left, duration %d seconds.", ($stats->{page_count} - $to_page - $pages_per_round), $stats->{page_count}, $vacuum_time);
+        logger('quiet', "Vacuum final: can not clean %d pages, %d pages left, duration %0.3f seconds.", ($stats->{page_count} - $to_page - $pages_per_round), $stats->{page_count}, $vacuum_time);
       } else {
         logger('quiet', "Vacuum final: %d pages left, duration %.3f seconds.", ($stats->{page_count}||0), $vacuum_time);
       }
@@ -920,7 +920,6 @@ sub process {
 
     $pages_before_vacuum = get_pages_before_vacuum($stats->{page_count}, $expected_page_count);
 
-    #warn "IS_COMPACTED:  (($stats->{page_count} <= $to_page + 1 + $pages_before_vacuum) && !$expected_error_occurred); ";
     $is_compacted = (($stats->{page_count} <= $to_page + 1 + $pages_before_vacuum) && !$expected_error_occurred); 
   }
 
@@ -958,7 +957,7 @@ sub process {
         }
 
         if ($initial_index_size_stats->{page_count} < MINIMAL_COMPACT_PAGES) {
-          logger('quiet', "Skipping reindex: %s.%s, %d pages from %d pages minimum required.".$schema_name, $index_data->{indexname}, $initial_index_size_stats->{page_count}, MINIMAL_COMPACT_PAGES);
+          logger('quiet', "Skipping reindex: %s.%s, %d pages from %d pages minimum required.",$schema_name, $index_data->{indexname}, $initial_index_size_stats->{page_count}, MINIMAL_COMPACT_PAGES);
           next;
         }
 
