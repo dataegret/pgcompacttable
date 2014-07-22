@@ -633,11 +633,6 @@ sub reindex {
   my $index_data = shift;
 
   _dbh->do(get_reindex_query($index_data));
-  #my $sql = $index_data->{indexdef};
-  #$sql =~ s/INDEX (\S+)/INDEX CONCURRENTLY pgcompact_index_$$/;
-  #$sql =~ s/( WHERE .*|$)/ TABLESPACE $index_data->{data}{tablespace}$1/ if (defined $index_data->{data}{tablespace});
-
-  #_dbh->do($sql);
 
   return;
 }
@@ -647,31 +642,16 @@ sub alter_index {
   my $table_name = shift;
   my $index_data = shift;
   
-  _dbh->do(get_alter_index_query($schema_name, $table_name, $index_data));
-#  my $constraint_ident = ($index_data && ref $index_data eq 'HASH' && $index_data->{conname}) ? $index_data->{conname} : '';
-#  my $sql =
-#    "BEGIN; SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . "; 
-#    " . ($constraint_ident ?
-#      ("ALTER TABLE (quote_ident(?) || '.' || quote_ident(?))  DROP CONSTRAINT ?;
-#ALTER TABLE (quote_ident('$schema_name') || '.' || quote_ident('$table_name')) ADD CONSTRAINT $constraint_ident ".($index_data->{contypedef}||"")." USING INDEX pgcompact_index_$$;") :
-#      ("DROP INDEX (quote_ident('$schema_name') || '.' || quote_ident('$index_data->{indexname}')); ALTER INDEX (quote_ident('$schema_name') || '.pgcompact_index_$$') RENAME TO (quote_ident('$schema_name') || '.' || quote_ident('$index_data->{indexname}'));")
-#    )."END;";
-  #if ($constraint_ident) {
-  #  _dbh->do("BEGIN; SET LOCAL statement_timeout TO ".LOCKED_ALTER_TIMEOUT."; ALTER TABLE (quote_ident(?) || '.' || quote_ident(?))  DROP CONSTRAINT ".$constraint_ident."; 
-#ALTER TABLE (quote_ident(?) || '.' || quote_ident(?)) ADD CONSTRAINT $constraint_ident ".($index_data->{contypedef}||'')." USING INDEX pgcompact_index_$$; END;", 
-  #    undef, $schema_name, $table_name, $schema_name, $index_data->{indexname}
-  #  );  
-  #} else {
-  #  _dbh->do("BEGIN; SET LOCAL statement_timeout TO ".LOCKED_ALTER_TIMEOUT.";DROP INDEX $schema_name.$index_data->{indexname};ALTER INDEX $schema_name.pgcompact_index_$$') RENAME TO $schema_name.$index_data->{indexname}; END;"
-  #  );
-  #}
-
-  return;
+  foreach my $sql (split(/;/, get_alter_index_query($schema_name, $table_name, $index_data))) {
+    next if ($sql =~ /^\s*$/);
+    _dbh->do("$sql;");
+  }
 }
 
 sub drop_temp_index {
   my $schema_name = shift;
 
+  _dbh->do("SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . ";"); 
   _dbh->do("DROP INDEX ?;", undef, "$schema_name.pgcompact_index_$$");
 
   return;
