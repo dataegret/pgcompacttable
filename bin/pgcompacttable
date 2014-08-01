@@ -1179,7 +1179,7 @@ foreach my $current_db_name (@dbs) {
     next if ($excluded_schemas{$current_ident->{schemaname}} || $excluded_tables{"$current_ident->{schemaname}.$current_ident->{tablename}"});
     logger('quiet', "Start handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
     for (my $attempt = 0; $attempt < $max_retry_count; $attempt++) {
-      next if process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt);
+      last if process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt);
     }
     logger('quiet', "Finish handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
   }
