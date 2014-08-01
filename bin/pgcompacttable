@@ -56,6 +56,13 @@ my $no_reindex;
 my $print_reindex_queries = 0;
 my $max_retry_count = 10;
 
+my $all_db;
+
+my $exclude_schema;
+my $exclude_table;
+my %excluded_schemas;
+my %excluded_tables;
+
 GetOptions(
             #help & man
             'help|?' => \$help,
@@ -73,9 +80,12 @@ GetOptions(
             'f|force' => \$force,
             'no-reindex' => \$no_reindex,
             'print-reindex-queries' => \$print_reindex_queries,
-            'max-retry-count|i' => \$max_retry_count,
+            'max-retry-count=i' => \$max_retry_count,
             'delay-ratio=i' => \$delay_ratio,
-            'routine_vacuum' => \$routine_vacuum,
+            'routine-vacuum' => \$routine_vacuum,
+            'all' => \$all_db,
+            'N|exclude-schema=s' => \$exclude_schema,
+            'T|exclude-table=s' => \$exclude_table,
           );
 
 $_log_level = $log_levels{$verbosity} || 1;
@@ -86,7 +96,7 @@ sub logger {
   my @message_args = @_;
 
   no strict;
-  print $_log sprintf("$message\n", @message_args) if (($log_levels{$level} || 1) >= $_log_level);
+  print $_log sprintf("[%s] $message\n", (scalar(localtime), @message_args)) if (($log_levels{$level} || 1) >= $_log_level);
   use strict;
 }
 
@@ -103,7 +113,7 @@ sub man {
 sub nice_size
 {
   my $size = shift;
-  my @sizes=qw( B KB MB GB TB PB);
+  my @sizes = qw/B KB MB GB TB PB/;
 
   my $i = 0;
 
@@ -127,10 +137,69 @@ sub db_connect {
   my $db_user = shift;
   my $db_password = shift;
 
+  logger('quiet', "Connecting to database %s", $db_name);
+
   $_dbh = DBI->connect("DBI:Pg:dbname=$db_name;host=$db_host;port=$db_port", $db_user, $db_password,{RaiseError => 0, PrintError => 0, AutoCommit => 1});
-  if($DBI::err) { die "Cannot connect to postgres: $DBI::errstr\n"; }
+  
+  if($DBI::err) { 
+    logger('quiet', "Cannot connect to database %s: %s", $db_name, $DBI::errstr); 
+    return undef;
+  }
 
   return $_dbh;
+}
+
+sub db_disconnect {
+  my $db_name = shift;
+  logger('quiet', "Disconnecting from database %s", ($db_name||''));
+  _dbh->disconnect;
+}
+
+sub get_databases {
+  my $sth = _dbh->prepare("
+SELECT datname FROM pg_catalog.pg_database
+WHERE
+    datname NOT IN ('template0')
+ORDER BY pg_catalog.pg_database_size(datname), datname
+  ");
+  $sth->execute;
+  my @result;
+  while(my ($db_name) = $sth->fetchrow_array) {
+    push @result, $db_name;
+  }
+
+  return @result;
+}
+
+sub get_database_tables {
+  my $sth = _dbh->prepare("
+SELECT schemaname, tablename FROM pg_catalog.pg_tables
+WHERE
+    NOT (schemaname = 'pg_catalog' AND tablename = 'pg_index') AND
+    schemaname !~ 'pg_(temp|toast|catalog).*' AND
+    NOT schemaname = 'information_schema'
+ORDER BY
+    pg_catalog.pg_relation_size(
+        quote_ident(schemaname) || '.' || quote_ident(tablename)),
+    schemaname, tablename 
+  ");
+  $sth->execute;
+  my $ret = [];
+  while(my $ident = $sth->fetchrow_hashref) {
+    push @$ret, $ident;
+  }
+  return $ret;
+}
+
+sub get_pgstattuple_schema_name {
+  my $sth = _dbh->prepare("
+SELECT nspname FROM pg_catalog.pg_proc
+JOIN pg_catalog.pg_namespace AS n ON pronamespace = n.oid
+WHERE proname = 'pgstattuple' LIMIT 1
+");
+  $sth->execute;
+  my ($pgstattuple_schema_name) = $sth->fetchrow_array; 
+  return $pgstattuple_schema_name;
 }
 
 sub get_size_stats {
@@ -161,17 +230,6 @@ FROM (
     die("Cannot get size statistics for table $ident_name.\n");
   }
   
-  return $result;
-}
-
-sub get_pgstattuple_schema_name {
-  my $sth = _dbh->prepare("
-    SELECT nspname FROM pg_catalog.pg_proc
-      JOIN pg_catalog.pg_namespace AS n ON pronamespace = n.oid
-      WHERE proname = 'pgstattuple' LIMIT 1");
-  $sth->execute();
-  my ($result) = $sth->fetchrow_array;
-
   return $result;
 }
 
@@ -660,6 +718,8 @@ sub drop_temp_index {
 #Process function
 
 sub process {
+  my $schema_name = shift;
+  my $table_name = shift;
   my $attempt = shift;
   
   my $is_skipped;
@@ -1083,13 +1143,49 @@ sub process {
 help && exit(1) if $help;
 man && exit(1) if $man;
 
-die "Cannot run without table name\n" unless ($table_name);
+my @dbs = ($db_name);
 
-db_connect($db_name, $db_host, $db_port, $db_user, $db_passwd);
-set_session_replication_role;
-create_clean_pages_function;
+if($all_db) {
+  db_connect('template1', $db_host, $db_port, $db_user, $db_passwd);
+  @dbs = get_databases;
+  db_disconnect;
+}
 
-process(0);
+if($exclude_schema) {
+  %excluded_schemas = map {$_ => 1} split(/,/,$exclude_schema);
+}
 
-drop_clean_pages_function;
+if($exclude_table) {
+  %excluded_tables = map {$_ => 1} split(/,/,$exclude_table);
+}
+
+
+foreach my $current_db_name (@dbs) {
+  unless(db_connect($current_db_name, $db_host, $db_port, $db_user, $db_passwd)) {
+    next;
+  }
+
+  set_session_replication_role;
+
+  unless(get_pgstattuple_schema_name) {
+    logger('qiuet', "Cannot handle database %s: pgstattuple extention is not found", $db_name);
+    db_disconnect($current_db_name);
+    next;
+  }
+
+  create_clean_pages_function;
+
+  foreach my $current_ident(($schema_name && $table_name) ? ({schemaname => $schema_name, tablename => $table_name}) : @{get_database_tables($db_name)}) {
+    next if ($excluded_schemas{$current_ident->{schemaname}} || $excluded_tables{"$current_ident->{schemaname}.$current_ident->{tablename}"});
+    logger('quiet', "Start handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
+    for (my $attempt = 0; $attempt < $max_retry_count; $attempt++) {
+      next if process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt);
+    }
+    logger('quiet', "Finish handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
+  }
+
+  drop_clean_pages_function;
+  
+  db_disconnect($current_db_name);
+}
 1;
