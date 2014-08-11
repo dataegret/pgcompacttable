@@ -1442,19 +1442,28 @@ foreach my $current_db_name (@dbs) {
     next;
   }
 
-  my $database_tables = get_database_tables($current_db_name);
-  unless($database_tables && ref $database_tables eq 'ARRAY') {
+  my $database_tables = ($schema_name && $table_name) ? [{schemaname => $schema_name, tablename => $table_name}] : get_database_tables($current_db_name);
+  unless($database_tables && ref $database_tables eq 'ARRAY' && scalar(@$database_tables) > 0) {
     logger('qiuet', "Skip handling database %s: cannot find tables", $current_db_name);
   }
 
-  foreach my $current_ident (($schema_name && $table_name) ? ({schemaname => $schema_name, tablename => $table_name}) : @$database_tables) {
-    next if (!$current_ident || ref $current_ident ne 'HASH' || $excluded_schemas{$current_ident->{schemaname}} || $excluded_tables{"$current_ident->{schemaname}.$current_ident->{tablename}"});
-    set_current_schema_name_table_name($current_ident->{schemaname}, $current_ident->{tablename});
-    logger('quiet', "Start handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
-    for (my $attempt = 0; $attempt < $max_retry_count; $attempt++) {
-      last if process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt);
+  for (my $attempt = 0; $attempt < $max_retry_count; $attempt++) {
+    logger('qiuet', "Handling tables. Attempt %s", ($attempt + 1));
+    my @retry_idents = ();
+
+    foreach my $current_ident (@$database_tables) {
+      next if (!$current_ident || ref $current_ident ne 'HASH' || $excluded_schemas{$current_ident->{schemaname}} || $excluded_tables{"$current_ident->{schemaname}.$current_ident->{tablename}"});
+      set_current_schema_name_table_name($current_ident->{schemaname}, $current_ident->{tablename});
+      logger('quiet', "Start handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
+      push @retry_idents, $current_ident unless process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt);
+      logger('quiet', "Finish handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
     }
-    logger('quiet', "Finish handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
+    
+    if (scalar @retry_idents > 0) {
+      @$database_tables = @retry_idents;
+    } else {
+      last;
+    }
   }
 
   drop_clean_pages_function;
