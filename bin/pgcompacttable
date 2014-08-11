@@ -1070,7 +1070,7 @@ sub process {
 
       $expected_page_count -= $pages_per_round;
       $vacuum_page_count += ($last_to_page - $to_page);
-
+      
       if ($routine_vacuum && $vacuum_page_count >= $pages_before_vacuum) {
         my $duration = $clean_pages_total_duration / ($last_loop - $loop);
         my $average_duration = $duration == 0 ? 0.0001 : $duration;
@@ -1188,11 +1188,11 @@ sub process {
 
   my $will_be_skipped;
   
-  $will_be_skipped = (!$force && ($stats->{page_count} < MINIMAL_COMPACT_PAGES || $bloat_stats->{free_percent} < MINIMAL_COMPACT_PERCENT))  unless ($is_locked);
-
-  my $is_reindexed;
+  $will_be_skipped = (!$force && ($is_skipped || $stats->{page_count} < MINIMAL_COMPACT_PAGES || $bloat_stats->{free_percent} < MINIMAL_COMPACT_PERCENT))  unless ($is_locked);
   
-  if (!$is_locked && ( $is_compacted || $attempt == $max_retry_count || !$is_skipped || $will_be_skipped) && (!$no_reindex || $print_reindex_queries)) {
+  my $is_reindexed;
+
+  if (!$is_locked && ( $is_compacted || $attempt == $max_retry_count || $is_skipped || (!$is_skipped && $will_be_skipped)) && (!$no_reindex || $print_reindex_queries)) {
      
     my $index_data_list = get_index_data_list($schema_name, $table_name) || [];
     
