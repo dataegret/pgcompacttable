@@ -3,15 +3,18 @@
 use strict;
 use warnings;
 
+use Pod::Usage;
+
 use Time::HiRes qw/time sleep/;
 use POSIX;
-use Getopt::Long;
+use Getopt::Long qw/:config no_ignore_case/;
 use DBI;
 
 use Data::Dumper;
 
-my $option_hash;
+our $VERSION = '0.1';
 
+local $| = 1;
 select(STDOUT);
 
 our $_log = select();
@@ -38,6 +41,7 @@ our %log_levels = (
 
 my $help;
 my $man;
+my $version;
 
 my $db_host = 'localhost';
 my $db_port = 5432;
@@ -67,23 +71,23 @@ GetOptions(
             #help & man
             'help|?' => \$help,
             'm|man' => \$man,
-
+            'V|version' => \$version,
             #database connection parameters
             'h|host=s' => \$db_host,
             'p|port=i' => \$db_port,
             'U|user=s' => \$db_user,
             'W|password=s' => \$db_passwd,
-            'd=s' => \$db_name,
+            'd|dbname=s' => \$db_name,
             'n|schema=s' => \$schema_name,
             't|table=s' => \$table_name,
             'v|verbosity=s' => \$verbosity,
             'f|force' => \$force,
-            'no-reindex' => \$no_reindex,
-            'print-reindex-queries' => \$print_reindex_queries,
-            'max-retry-count=i' => \$max_retry_count,
-            'delay-ratio=i' => \$delay_ratio,
-            'routine-vacuum' => \$routine_vacuum,
-            'all' => \$all_db,
+            'r|no-reindex' => \$no_reindex,
+            's|print-reindex-queries' => \$print_reindex_queries,
+            'o|max-retry-count=i' => \$max_retry_count,
+            'E|delay-ratio=i' => \$delay_ratio,
+            'R|routine-vacuum' => \$routine_vacuum,
+            'a|all' => \$all_db,
             'N|exclude-schema=s' => \$exclude_schema,
             'T|exclude-table=s' => \$exclude_table,
           );
@@ -93,6 +97,33 @@ $_log_level = $log_levels{$verbosity} || 1;
 our $_current_db_name;
 our $_current_schema_name;
 our $_current_table_name;
+
+sub not_enough_arguments {
+  logger('quiet', "%s: At least one of the options must be specified: all, dbname", $0);
+  logger('quit', "Use --help for short help, --man for full manual.");
+}
+
+sub help {
+  pod2usage(
+    -message => "",
+    -verbose => 99,
+    -exitval => 1,
+    -sections => 'NAME|SYNOPSIS|EXAMPLES',
+  ); 
+}
+
+sub man {
+  pod2usage(
+    -message => "",
+    -verbose => 99,
+    -exitval => 1,
+    -sections => '|NAME|SYNOPSIS|DESCRIPTION|OPTIONS|LICENSE AND COPYRIGHT|VERSION|AUTHOR'
+  );
+}
+
+sub version {
+  logger('quiet', "%s v%s", $0, $VERSION);
+}
 
 sub set_current_db_name {
   $_current_db_name = shift;
@@ -118,18 +149,8 @@ sub logger {
   my @message_args = @_;
 
   no strict;
-  print $_log sprintf("[%s](%s) $message\n", (scalar(localtime), (($_current_db_name ? "$_current_db_name:" : "").(($_current_schema_name && $_current_table_name) ? "$_current_schema_name.$_current_table_name" : "")), @message_args)) if (($log_levels{$level} || 1) >= $_log_level);
+  print $_log sprintf("%s$message\n", ($_current_db_name ? sprintf("[%s](%s%s) ", scalar(localtime), $_current_db_name, ($_current_schema_name && $_current_table_name) ? ":$_current_schema_name.$_current_table_name" : "") : ""), @message_args) if (($log_levels{$level} || 1) >= $_log_level);
   use strict;
-}
-
-sub help {
-  logger('quiet', "This is help");
-  return 1;
-}
-
-sub man {
-  logger('quiet', "This is man");
-  return 1;
 }
 
 sub nice_size
@@ -458,8 +479,7 @@ sub vacuum {
   my $analyze = shift; 
   
 
-  #my $sth = _dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : '')."(quote_ident(?)||'.'||quote_ident(?)", undef, $schema_name, $table_name);
-  my $sth = _dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : '')."$schema_name.$table_name");
+  my $sth = _dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : ''). _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name));
   
   if ($DBI::err) {
     logger('quiet', "SQL Error: %s", $DBI::errstr);
@@ -474,7 +494,7 @@ sub analyze {
   my $table_name = shift;
 
   #my $sth = $_dbh->do('ANALYZE (quote_ident(?)||'.'||quote_ident(?)', undef, $schema_name, $table_name);
-  my $sth = $_dbh->do("ANALYZE $schema_name.$table_name");
+  my $sth = $_dbh->do("ANALYZE "._dbh->quote_identifier($schema_name)."."._dbh->quote_identifier($table_name));
 
   if ($DBI::err) {
     logger('quiet', "SQL Error: %s", $DBI::errstr);
@@ -734,14 +754,14 @@ sub get_alter_index_query {
   my $table_name = shift;
   my $index_data = shift;
 
-  my $constraint_ident = $index_data->{conname} if ($index_data && ref $index_data eq 'HASH' && $index_data->{conname});
+  my $constraint_ident = _dbh->quote_identifier($index_data->{conname}) if ($index_data && ref $index_data eq 'HASH' && $index_data->{conname});
 
   return
     "BEGIN; SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . "; 
     " . ($constraint_ident ?
-      ("ALTER TABLE $schema_name.$table_name  DROP CONSTRAINT $constraint_ident;
-ALTER TABLE $schema_name.$table_name ADD CONSTRAINT $constraint_ident $index_data->{contypedef} USING INDEX pgcompact_index_$$;") :
-      ("DROP INDEX $schema_name.$index_data->{indexname}; ALTER INDEX $schema_name.pgcompact_index_$$ RENAME TO $index_data->{indexname};")
+      ("ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name) . " DROP CONSTRAINT $constraint_ident;
+ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name) . " ADD CONSTRAINT $constraint_ident $index_data->{contypedef} USING INDEX pgcompact_index_$$;") :
+      ("DROP INDEX " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($index_data->{indexname}) . "; ALTER INDEX " . _dbh->quote_identifier($schema_name) . ".pgcompact_index_$$ RENAME TO " . _dbh->quote_identifier($index_data->{indexname}) . ";")
     )."END;";
 }
 
@@ -751,7 +771,7 @@ sub get_straight_reindex_query {
   my $index_data = shift;
 
   #return "REINDEX INDEX (quote_ident('$schema_name') || . || quote_ident('$index_data->{indexname}'));";
-  return "REINDEX INDEX ('$schema_name.$index_data->{indexname}')";
+  return "REINDEX INDEX ('" . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($index_data->{indexname})."')";
 }
 
 sub get_index_bloat_stats {
@@ -1383,8 +1403,25 @@ sub process {
 
 #Main code
 
-help && exit(1) if $help;
-man && exit(1) if $man;
+if ($help) {
+  help;
+  exit(1);
+}
+
+if ($man) {
+  man;
+  exit(1);
+}
+
+if ($version) {
+  version;
+  exit(1);
+}
+
+unless (($db_name && $table_name) || $all_db) {
+  not_enough_arguments();
+  exit(1);
+}
 
 my @dbs = ($db_name);
 
@@ -1470,4 +1507,241 @@ foreach my $current_db_name (@dbs) {
   
   db_disconnect($current_db_name);
 }
+
 1;
+
+=head1 NAME
+
+B<pgcompacttable> - PostgreSQL bloat reducing tool.
+
+=head1 SYNOPSIS
+
+pgcompacttable [OPTION...]
+
+=over 4
+
+=item General options:
+
+[-?mV] [(-q | -v LEVEL)]
+
+=item Connection options:
+
+[-h HOST] [-p PORT] [-U USER] [-W PASSWD] [-P PATH]
+
+=item Targeting options:
+
+(-a | -d DBNAME...) [-n SCHEMA...] [-t TABLE...] [-D DBNAME...]
+[-N SCHEMA...] [-T TABLE...]
+
+=back
+
+=head1 DESCRIPTION
+
+B<pgcompacttable> is a tool to reduce bloat for tables and indexes without
+heavy locks.
+
+=over 4
+
+=back
+
+pgstattuple must be installed. B<pgcompacttable> uses pgstattuple to get statistics. 
+
+=head1 EXAMPLES
+
+Shows usage manual.
+
+  pgcompacttable --man
+Compacts all the bloated tables in all the database in the cluster plus their bloated indexes. Prints additional progress information.
+
+  pgcompacttable --all --verbose info
+
+Compacts all the bloated tables in the billing database and their bloated indexes excepts ones that are in the pgq schema.
+
+  pgcompacttable --dbname billing --exclude-schema pgq
+
+=head1 OPTIONS
+
+=head2 General options
+
+=over 4
+
+=item B<-?>
+
+=item B<--help>
+
+Display short help.
+
+=item B<-m>
+
+=item B<--man>
+
+Display full manual.
+
+=item B<-V>
+
+=item B<--version>
+
+Print version.
+
+=item B<-q>
+
+=item B<--quiet>
+
+Do not display progress messages. The same as C<-v warning>.
+
+=item B<-v> LEVEL
+
+=item B<--verbosity> LEVEL
+
+A verbosity level. One of C<warning>, C<notice>, C<info>. By default C<notice>.
+
+=back
+
+=head2 Connection options
+
+The B<pgcompacttable> tries to connect to the database with the DBI Perl module. 
+
+If some of the connection options is not specified the tool tries to
+get it from C<PGHOST>, C<PGPORT>, C<PGUSER>, C<PGPASSWORD> environment
+variables. If password is still unknown after that than it tries to
+get it from the password file that C<PGPASSFILE> refers to and if this
+file does not exist it tries to get it from C<HOME/.pgpass> file.
+
+=over 4
+
+=item B<-h> HOST
+
+=item B<--host> HOST
+
+A database host. By default C<localhost>.
+
+=item B<-p> PORT
+
+=item B<--port> PORT
+
+A database port. By default C<5432>.
+
+=item B<-U> USER
+
+=item B<--user> USER
+
+A database user. By default current system user is used (as returned by whoami).
+
+=item B<-W> PASSWD
+
+=item B<--password> PASSWD
+
+A password for the user.
+
+=back
+
+=head2 Targeting options
+
+Note that if you specified a database, schema or table that is not in the cluster it will be ignored. Redundant exclusions will be ignored too. All these options except C<--all> can be specified several times.
+
+=over 4
+
+=item B<-a>
+
+=item B<--all>
+
+Process all the databases in the cluster.
+
+=item B<-d> DBNAME
+
+=item B<--dbname> DBNAME
+
+A database to process. By default all the user databses of the instance are processed.
+
+=item B<-D> DBNAME
+
+=item B<--exclude-dbname> DBNAME
+
+A database to exclude from processing.
+
+=item B<-n> SCHEMA
+
+=item B<--schema> SCHEMA
+
+A schema to process. By default 'public' schema id processed.
+
+=item B<-N> SCHEMA
+
+=item B<--exclude-schema> SCHEMA
+
+A schema to exclude from processing.
+
+=item B<-t> TABLE
+
+=item B<--table> TABLE
+
+A table to process. By default all the tables of the specified schema are processed.
+
+=item B<-T> TABLE
+
+=item B<--exclude-table> TABLE
+
+A table to exclude from processing.
+
+=back
+
+=head2 Options controlling the behaviour
+
+=over 4
+
+=item B<-R>
+
+=item B<--routine-vacuum>
+
+Turn on the routine vacuum. By default all the vacuums are off.
+
+=item B<-r>
+
+=item B<--no-reindex>
+
+Reindex tables after processing.
+
+=item B<-s>
+
+=item B<--print-reindex-queries>
+
+Print reindex queries. Useful if you want to perform manual
+reindex later.
+
+=item B<-f>
+
+=item B<--force>
+
+Try to compact even those tables and indexes that do not meet minimal bloat requirements.
+
+=item B<-E> RATIO
+
+=item B<--delay-ratio> RATIO
+
+A dynamic part of the delay between rounds is calculated as previous-round-time * delay-ratio. By default 2.
+
+=item B<-o> COUNT
+
+=item B<--max-retry-count> COUNT
+
+A maximum number of retries in case of unsuccessful processing. By default 10.
+
+=item B<-x> COUNT
+
+=back
+
+=cut
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright (c) 2014 Maxim Boguk
+
+=head1 AUTHOR
+
+=over 4
+
+=item L<Maxim Boguk|mailto:maxim.boguk@gmail.com>
+
+=back
+
+=cut
