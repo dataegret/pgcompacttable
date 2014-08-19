@@ -67,6 +67,8 @@ my $exclude_table;
 my %excluded_schemas;
 my %excluded_tables;
 
+my %table_stats;
+
 GetOptions(
             #help & man
             'help|?' => \$help,
@@ -876,7 +878,8 @@ sub process {
   my $schema_name = shift;
   my $table_name = shift;
   my $attempt = shift;
-  
+  my $base = shift;
+
   my $is_skipped;
   my $is_locked = try_advisory_lock($schema_name, $table_name) ? 0 : 1;
 
@@ -892,8 +895,7 @@ sub process {
     return -1;
   }
 
-  my $base_stats;
-  $base_stats = {%$stats} unless ($base_stats);
+  $base->{stats} = {%$stats} unless ($base->{stats});
 
   if (!$is_locked) {
     my $vacuum_time = time;
@@ -1084,7 +1086,7 @@ sub process {
       sleep($delay_ratio * (time - $start_time));
 
       if (time - $progress_report_time >= PROGRESS_REPORT_PERIOD && $last_to_page != $to_page) {
-        logger('quiet', "Progress: %s %d pages completed.", (defined $bloat_stats->{effective_page_count} ? int(100 * ($to_page ? ($initial_size_stats->{page_count} - $to_page - 1) / ($base_stats->{page_count} - $bloat_stats->{effective_page_count}) : 1) ).'%, ' : ' '), ($base_stats->{page_count} - $to_page - 1));
+        logger('quiet', "Progress: %s %d pages completed.", (defined $bloat_stats->{effective_page_count} ? int(100 * ($to_page ? ($initial_size_stats->{page_count} - $to_page - 1) / ($base->{stats}{page_count} - $bloat_stats->{effective_page_count}) : 1) ).'%, ' : ' '), ($base->{stats}{page_count} - $to_page - 1));
         $progress_report_time = time;
       }
 
@@ -1382,8 +1384,8 @@ sub process {
       logger('quiet', "Processing results: %d pages left (%d pages including toasts and indexes), size reduced by %s (%s including toasts and indexes) in total , approximately %d%% (%d pages) that is %s more were expected to be compacted after this attempt.",
         $stats->{page_count},
         $stats->{total_page_count},
-        nice_size($base_stats->{size}),
-        nice_size($base_stats->{total_size}),
+        nice_size($base->{stats}{size}),
+        nice_size($base->{stats}{total_size}),
         $bloat_stats->{free_percent},
         $stats->{page_count} - $bloat_stats->{effective_page_count},
         nice_size($bloat_stats->{free_space})
@@ -1392,8 +1394,8 @@ sub process {
       logger('quiet', "Processing results: %d pages left (%d pages including toasts and indexes), size reduced by %s (%s including toasts and indexes) in total.",
         $stats->{page_count},
         $stats->{total_page_count},
-        nice_size($base_stats->{size}),
-        nice_size($base_stats->{total_size}),
+        nice_size($base->{stats}{size}),
+        nice_size($base->{stats}{total_size}),
       );
     }
   }
@@ -1492,7 +1494,8 @@ foreach my $current_db_name (@dbs) {
       next if (!$current_ident || ref $current_ident ne 'HASH' || $excluded_schemas{$current_ident->{schemaname}} || $excluded_tables{"$current_ident->{schemaname}.$current_ident->{tablename}"});
       set_current_schema_name_table_name($current_ident->{schemaname}, $current_ident->{tablename});
       logger('quiet', "Start handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
-      push @retry_idents, $current_ident unless process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt);
+      $table_stats{$current_db_name.$current_ident->{schemaname}.$current_ident->{tablename}} = {} unless (ref $table_stats{$current_db_name.$current_ident->{schemaname}.$current_ident->{tablename}} eq 'HASH');
+      push @retry_idents, $current_ident unless process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt, $table_stats{$current_db_name.$current_ident->{schemaname}.$current_ident->{tablename}});
       logger('quiet', "Finish handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
     }
     
