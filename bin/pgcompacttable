@@ -7,6 +7,7 @@ use Pod::Usage;
 
 use Time::HiRes qw/time sleep/;
 use POSIX;
+use List::Util qw/sum/;
 use Getopt::Long qw/:config no_ignore_case/;
 use DBI;
 
@@ -31,17 +32,16 @@ use constant PAGES_BEFORE_VACUUM_UPPER_DIVISOR => 50;
 use constant PROGRESS_REPORT_PERIOD => 60;
 use constant LOCKED_ALTER_TIMEOUT => 1000;
 use constant LOCKED_ALTER_COUNT => 100;
+use constant LOG_ALWAYS => 1000;
+use constant LOG_ERROR => 2;
+use constant LOG_WARNING => 1;
+use constant LOG_NOTICE => 0;
+
 # Settings & defaults
 
-our %log_levels = (
-  'quiet' => 0,
-  'notice' => 1,
-  'verbose' => 2
-);
-
-my $help;
-my $man;
-my $version;
+my $show_version;
+my $show_help;
+my $show_man;
 
 my $db_host = 'localhost';
 my $db_port = 5432;
@@ -52,7 +52,9 @@ my $db_name = $ENV{LOGNAME} || $ENV{USER} || getpwuid($<);
 my $schema_name = 'public';
 my $table_name;
 
-my $verbosity = 'notice';
+my $verbose;
+my $quiet;
+
 my $force;
 my $delay_ratio = 0;
 my $routine_vacuum;
@@ -67,13 +69,13 @@ my $exclude_table;
 my %excluded_schemas;
 my %excluded_tables;
 
-my %table_stats;
+my %table_info;
 
 GetOptions(
             #help & man
-            'help|?' => \$help,
-            'm|man' => \$man,
-            'V|version' => \$version,
+            'V|version' => \$show_version,
+            'help|?' => \$show_help,
+            'm|man' => \$show_man,
             #database connection parameters
             'h|host=s' => \$db_host,
             'p|port=i' => \$db_port,
@@ -82,7 +84,8 @@ GetOptions(
             'd|dbname=s' => \$db_name,
             'n|schema=s' => \$schema_name,
             't|table=s' => \$table_name,
-            'v|verbosity=s' => \$verbosity,
+            'v|verbose' => \$verbose,
+            'q|quiet' => \$quiet,
             'f|force' => \$force,
             'r|no-reindex' => \$no_reindex,
             's|print-reindex-queries' => \$print_reindex_queries,
@@ -94,18 +97,21 @@ GetOptions(
             'T|exclude-table=s' => \$exclude_table,
           );
 
-$_log_level = $log_levels{$verbosity} || 1;
+my $_verbosity = ($verbose ? LOG_NOTICE : ($quiet ? LOG_ERROR : LOG_WARNING));
 
 our $_current_db_name;
 our $_current_schema_name;
 our $_current_table_name;
 
 sub not_enough_arguments {
-  logger('quiet', "%s: At least one of the options must be specified: all, dbname", $0);
+  logger(LOG_ALWAYS, "%s: At least one of the options must be specified: all, dbname", $0);
   logger('quit', "Use --help for short help, --man for full manual.");
 }
 
-sub help {
+sub show_version {
+  logger(LOG_ALWAYS, "%s v%s", $0, $VERSION);
+}
+sub show_help {
   pod2usage(
     -message => "",
     -verbose => 99,
@@ -114,7 +120,7 @@ sub help {
   ); 
 }
 
-sub man {
+sub show_man {
   pod2usage(
     -message => "",
     -verbose => 99,
@@ -123,9 +129,6 @@ sub man {
   );
 }
 
-sub version {
-  logger('quiet', "%s v%s", $0, $VERSION);
-}
 
 sub set_current_db_name {
   $_current_db_name = shift;
@@ -142,16 +145,17 @@ sub unset_current_db_name {
 
 sub unset_current_schema_name_table_name {
   undef $_current_schema_name;
-  undef$_current_table_name;
+  undef $_current_table_name;
 }
 
 sub logger {
   my $level = shift;
   my $message = shift;
   my @message_args = @_;
-
+  $level = LOG_WARNING unless ($level =~ /^\d+$/);
+  return if ($level < $_verbosity);
   no strict;
-  print $_log sprintf("%s$message\n", ($_current_db_name ? sprintf("[%s](%s%s) ", scalar(localtime), $_current_db_name, ($_current_schema_name && $_current_table_name) ? ":$_current_schema_name.$_current_table_name" : "") : ""), @message_args) if (($log_levels{$level} || 1) >= $_log_level);
+  print $_log sprintf("%s%s$message\n", ($level == LOG_ALWAYS ? '' : sprintf("[%s] ", scalar(localtime))), ($_current_db_name ? sprintf("(%s%s) ", $_current_db_name, ($_current_schema_name && $_current_table_name) ? ":$_current_schema_name.$_current_table_name" : "") : ""), @message_args);
   use strict;
 }
 
@@ -182,12 +186,12 @@ sub db_connect {
   my $db_user = shift;
   my $db_password = shift;
 
-  logger('quiet', "Connecting to database");
+  logger(LOG_WARNING, "Connecting to database");
 
   $_dbh = DBI->connect("DBI:Pg:dbname=$db_name;host=$db_host;port=$db_port", $db_user, $db_password,{RaiseError => 0, PrintError => 0, AutoCommit => 1});
   
   if($DBI::err) { 
-    logger('quiet', "Cannot connect DBI:Pg:dbname=%s;host=%s;port=%s user=%s,passwd=...: %s", $db_name, $db_host, $db_port, $db_user, $DBI::errstr); 
+    logger(LOG_WARNING, "Cannot connect DBI:Pg:dbname=%s;host=%s;port=%s user=%s,passwd=...: %s", $db_name, $db_host, $db_port, $db_user, $DBI::errstr); 
     return undef;
   }
 
@@ -196,7 +200,7 @@ sub db_connect {
 
 sub db_disconnect {
   my $db_name = shift;
-  logger('quiet', "Disconnecting from database");
+  logger(LOG_WARNING, "Disconnecting from database");
   _dbh->disconnect;
 }
 
@@ -210,7 +214,7 @@ ORDER BY pg_catalog.pg_database_size(datname), datname
   $sth->execute;
   
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -236,7 +240,7 @@ ORDER BY
   ");
   
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -257,7 +261,7 @@ WHERE proname = 'pgstattuple' LIMIT 1
   $sth->execute;
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -287,14 +291,14 @@ FROM (
   $sth->execute($schema_name, $table_name, $schema_name, $table_name);
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
   my $result = $sth->fetchrow_hashref;
   
   if (! $result || ref $result ne 'HASH') {
-    logger('quiet',"Cannot get size statistics");
+    logger(LOG_WARNING,"Cannot get size statistics");
   }
   
   return $result;
@@ -336,7 +340,7 @@ sub get_bloat_stats {
   $sth->execute($schema_name, $table_name, $schema_name, $table_name);
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -373,7 +377,7 @@ sub get_update_column {
   $sth->execute($schema_name, $table_name, $schema_name, $table_name);
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -418,13 +422,13 @@ sub get_max_tupples_per_page {
   $sth->execute;
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
   my ($result) = $sth->fetchrow_array; 
 
-  logger('quiet', 'Can not get max tupples per page.') unless(defined $result);
+  logger(LOG_WARNING, 'Can not get max tupples per page.') unless(defined $result);
 
   return $result;
 }
@@ -443,7 +447,7 @@ sub has_triggers {
   $sth->execute;
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -464,7 +468,7 @@ sub try_advisory_lock {
   $sth->execute($schema_name, $table_name);
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -484,7 +488,7 @@ sub vacuum {
   my $sth = _dbh->do('VACUUM '.($analyze ? 'ANALYZE ' : ''). _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name));
   
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -499,7 +503,7 @@ sub analyze {
   my $sth = $_dbh->do("ANALYZE "._dbh->quote_identifier($schema_name)."."._dbh->quote_identifier($table_name));
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -510,7 +514,7 @@ sub set_session_replication_role {
   my $sth = $_dbh->do('set session_replication_role to replica;');
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -607,7 +611,7 @@ END \$\$;
   ");
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -619,7 +623,7 @@ sub drop_clean_pages_function {
     DROP FUNCTION public.pgcompact_clean_pages_$$(text, text,integer, integer, integer);
     ");
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -641,7 +645,7 @@ sub clean_pages {
   $sth->execute($ident_name, $column_name, $to_page,  $pages_per_round, $max_tupples_per_page);
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     die $DBI::errstr;
   }
   
@@ -703,7 +707,7 @@ ORDER BY 8
   $sth->execute($schema_name, $table_name);
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -731,7 +735,7 @@ FROM (
   $sth->execute($schema_name, $index_name);
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -818,7 +822,7 @@ FROM (
   $sth->execute($schema_name, $index_name, $schema_name, $index_name);
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -833,7 +837,7 @@ sub reindex {
   _dbh->do(get_reindex_query($index_data));
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -850,7 +854,7 @@ sub alter_index {
     _dbh->do("$sql;");
 
     if ($DBI::err) {
-      logger('quiet', "SQL Error: %s", $DBI::errstr);
+      logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
       die;
       #return undef;
     }
@@ -865,7 +869,7 @@ sub drop_temp_index {
   _dbh->do("DROP INDEX ?;", undef, "$schema_name.pgcompact_index_$$");
 
   if ($DBI::err) {
-    logger('quiet', "SQL Error: %s", $DBI::errstr);
+    logger(LOG_WARNING, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -878,49 +882,49 @@ sub process {
   my $schema_name = shift;
   my $table_name = shift;
   my $attempt = shift;
-  my $base = shift;
+  my $table_info = shift;
 
   my $is_skipped;
   my $is_locked = try_advisory_lock($schema_name, $table_name) ? 0 : 1;
 
   if ($DBI::err) {
-    logger('quiet', "Table handling interrupt.");
+    logger(LOG_WARNING, "Table handling interrupt.");
     return -1;
   }
 
-  my $stats = get_size_stats($schema_name, $table_name); 
+  $table_info->{stats} = get_size_stats($schema_name, $table_name); 
 
   if ($DBI::err) {
-    logger('quiet', "Table handling interrupt.");
+    logger(LOG_WARNING, "Table handling interrupt.");
     return -1;
   }
 
-  $base->{stats} = {%$stats} unless ($base->{stats});
+  $table_info->{base_stats} = {%{$table_info->{stats}}} unless ($table_info->{base_stats});
 
   if (!$is_locked) {
     my $vacuum_time = time;
     vacuum($schema_name, $table_name);
 
     if ($DBI::err) {
-      logger('quiet', "Table handling interrupt.");
+      logger(LOG_WARNING, "Table handling interrupt.");
       return -1;
     }    
 
     $vacuum_time = time - $vacuum_time;
-    $stats = get_size_stats($schema_name, $table_name);
+    $table_info->{stats} = get_size_stats($schema_name, $table_name);
     if ($DBI::err) {
-      logger('quiet', "Table handling interrupt."); 
+      logger(LOG_WARNING, "Table handling interrupt."); 
       return -1;
     }
 
-#  if ($stats->{page_count} > $stats->{page_count}) {
-#    logger('quiet', "Vacuum initial: can not clean %d pages, %d' pages left, duration %d seconds.", ($stats->{page_count} - $stats->{page_count}), $stats->{page_count}, $vacuum_time);
+#  if ($table_info->{stats}->{page_count} > $table_info->{stats}->{page_count}) {
+#    logger(LOG_WARNING, "Vacuum initial: can not clean %d pages, %d' pages left, duration %d seconds.", ($table_info->{stats}->{page_count} - $table_info->{stats}->{page_count}), $table_info->{stats}->{page_count}, $vacuum_time);
 #  } else {
-      logger('quiet', "Vacuum initial: %d pages left, duration %.3f seconds.", ($stats->{page_count}||0), $vacuum_time);
+      logger(LOG_WARNING, "Vacuum initial: %d pages left, duration %.3f seconds.", ($table_info->{stats}->{page_count}||0), $vacuum_time);
 #  }
 
-    if($stats->{page_count} <= 1) {
-      logger('quiet', "Skipping processing: empty or 1 page table.");
+    if($table_info->{stats}->{page_count} <= 1) {
+      logger(LOG_WARNING, "Skipping processing: empty or 1 page table.");
       $is_skipped = 1;
     }
   }
@@ -932,35 +936,35 @@ sub process {
     $bloat_stats = get_bloat_stats($schema_name, $table_name);
 
     if ($DBI::err) {
-      logger('quiet', "Table handling interrupt.");
+      logger(LOG_WARNING, "Table handling interrupt.");
       return -1;
     }
  
     $get_stat_time = time - $get_stat_time;
     if ($bloat_stats->{effective_page_count}) {
-      logger('quiet',"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time);
+      logger(LOG_WARNING,"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time);
     } else {
       my $analyze_time = time;
       analyze($schema_name, $table_name);
       
       if ($DBI::err) {
-        logger('quiet', "Table handling interrupt.");
+        logger(LOG_WARNING, "Table handling interrupt.");
         return -1;
       }
 
       $analyze_time = time - $analyze_time;
-      logger('quiet', "Analyze required initial: duration %.3f second.", $analyze_time);
+      logger(LOG_WARNING, "Analyze required initial: duration %.3f second.", $analyze_time);
       $get_stat_time = time;
       $bloat_stats = get_bloat_stats($schema_name, $table_name);
       
       if ($DBI::err) {
-        logger('quiet', "Table handling interrupt.");
+        logger(LOG_WARNING, "Table handling interrupt.");
         return -1;
       }
 
       $get_stat_time = time - $get_stat_time;
       if ($bloat_stats->{effective_page_count}) {
-        logger('quiet', "Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time)
+        logger(LOG_WARNING, "Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time)
       } else {
         logger('qiuet', "Can not get bloat statistics, processing stopped.");
         $is_skipped = 1;  
@@ -968,40 +972,40 @@ sub process {
     }
   }
   if (!$is_locked && !$is_skipped) {
-    my $can_be_compacted = ($bloat_stats->{'free_percent'} > 0 && ($stats->{page_count} > $bloat_stats->{effective_page_count}));
+    my $can_be_compacted = ($bloat_stats->{'free_percent'} > 0 && ($table_info->{stats}->{page_count} > $bloat_stats->{effective_page_count}));
     if ($can_be_compacted) {
-      logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes) , approximately %0.3f%% (%d pages) can be compacted reducing the size by %s.",
-        $stats->{page_count},
-        $stats->{total_page_count},
+      logger(LOG_WARNING, "Statistics: %d pages (%d pages including toasts and indexes) , approximately %0.3f%% (%d pages) can be compacted reducing the size by %s.",
+        $table_info->{stats}->{page_count},
+        $table_info->{stats}->{total_page_count},
         $bloat_stats->{'free_percent'},
-        ($stats->{page_count} - $bloat_stats->{effective_page_count}),
+        ($table_info->{stats}->{page_count} - $bloat_stats->{effective_page_count}),
         nice_size($bloat_stats->{free_space})
       );
     } else {
-      logger('quiet', "Statistics: %d pages (%d pages including toasts and indexes)",
-        $stats->{page_count},
-        $stats->{total_page_count}
+      logger(LOG_WARNING, "Statistics: %d pages (%d pages including toasts and indexes)",
+        $table_info->{stats}->{page_count},
+        $table_info->{stats}->{total_page_count}
       );
     }
 
     if(has_triggers($schema_name, $table_name)) {
       
       if ($DBI::err) {
-        logger('quiet', "Table handling interrupt.");
+        logger(LOG_WARNING, "Table handling interrupt.");
         return -1;
       }
 
-      logger('quiet','Can not process: "always" or "replica" triggers are on.');
+      logger(LOG_WARNING,'Can not process: "always" or "replica" triggers are on.');
       $is_skipped = 1;
     }
 
     if(!$force) {      
-      if($stats->{page_count} < MINIMAL_COMPACT_PAGES) {
-        logger('quiet',"Skipping processing: %d pages from %d pages minimum required.'", $stats->{page_count}, MINIMAL_COMPACT_PAGES);
+      if($table_info->{stats}->{page_count} < MINIMAL_COMPACT_PAGES) {
+        logger(LOG_WARNING,"Skipping processing: %d pages from %d pages minimum required.'", $table_info->{stats}->{page_count}, MINIMAL_COMPACT_PAGES);
         $is_skipped = 1;
       }
       if(($bloat_stats->{free_percent}||0) <= MINIMAL_COMPACT_PERCENT) {
-        logger('quiet',"Skipping processing: %0.2f%% space to compact from 20%% minimum required.",($bloat_stats->{free_percent}||0));
+        logger(LOG_WARNING,"Skipping processing: %0.2f%% space to compact from 20%% minimum required.",($bloat_stats->{free_percent}||0));
         $is_skipped = 1;  
       }
     }
@@ -1010,41 +1014,41 @@ sub process {
   my $is_compacted;
   
   if (!$is_locked && !$is_skipped) {
-    logger('quiet', "Processing forced.") if ($force);
+    logger(LOG_WARNING, "Processing forced.") if ($force);
     my $vacuum_page_count = 0;
-    my $initial_size_stats = {%$stats};
-    my $to_page = $stats->{page_count} - 1;
+    my $initial_size_stats = {%{$table_info->{stats}}};
+    my $to_page = $table_info->{stats}->{page_count} - 1;
     my $progress_report_time = time;
     my $clean_pages_total_duration = 0;
-    my $last_loop = $stats->{page_count} + 1;
+    my $last_loop = $table_info->{stats}->{page_count} + 1;
     my $expected_error_occurred = 0;
 
-    my $expected_page_count = $stats->{page_count};
+    my $expected_page_count = $table_info->{stats}->{page_count};
     my $column_name = get_update_column($schema_name, $table_name);
 
     if ($DBI::err) {
-      logger('quiet', "Table handling interrupt.");
+      logger(LOG_WARNING, "Table handling interrupt.");
       return -1;
     }
 
-    my $pages_per_round = get_pages_per_round($stats->{page_count}, $to_page);
-    my $pages_before_vacuum = get_pages_before_vacuum($stats->{page_count}, $expected_page_count);
+    my $pages_per_round = get_pages_per_round($table_info->{stats}->{page_count}, $to_page);
+    my $pages_before_vacuum = get_pages_before_vacuum($table_info->{stats}->{page_count}, $expected_page_count);
 
     my $max_tupples_per_page = get_max_tupples_per_page($schema_name, $table_name);
 
     if ($DBI::err) {
-      logger('quiet', "Table handling interrupt.");
+      logger(LOG_WARNING, "Table handling interrupt.");
       return -1;
     }
 
-    logger('quiet', "Update by column: %s.", $column_name||'');
-    logger('quiet', "Set pages/round: %d.",  $pages_per_round);
-    logger('quiet', "Set pages/vacuum: %d.", $pages_before_vacuum);
+    logger(LOG_WARNING, "Update by column: %s.", $column_name||'');
+    logger(LOG_WARNING, "Set pages/round: %d.",  $pages_per_round);
+    logger(LOG_WARNING, "Set pages/vacuum: %d.", $pages_before_vacuum);
 
     my $start_time;
     my $last_to_page;
     my $loop;
-    for ($loop = $stats->{page_count}; $loop > 0; $loop--) {
+    for ($loop = $table_info->{stats}->{page_count}; $loop > 0; $loop--) {
       $start_time = time;
       _dbh->begin_work;
       $last_to_page = $to_page;
@@ -1058,14 +1062,14 @@ sub process {
         _dbh->rollback();
 
         if ($@ =~ 'deadlock detected') {
-          logger('quiet',"Detected deadlock during cleaning.");
+          logger(LOG_WARNING,"Detected deadlock during cleaning.");
           next;
         } elsif ($@ =~ 'cannot extract system attribute') {
-          logger('quiet', "System attribute extraction error has occurred, processing stopped.");
+          logger(LOG_WARNING, "System attribute extraction error has occurred, processing stopped.");
           $expected_error_occurred = 1;
           last;
         } else {
-          logger('quiet',"Cannot handle table: %s",$@);
+          logger(LOG_WARNING,"Cannot handle table: %s",$@);
           return -1;
         }
       } else {
@@ -1078,7 +1082,7 @@ sub process {
           }
         } else {
           # Bug trap warning
-          logger('quiet', "Incorrect result of cleaning: column_name %s, to_page %d, pages_per_round %d, max_tupples_per_page %d.",$column_name, $last_to_page, $pages_per_round, $max_tupples_per_page);
+          logger(LOG_WARNING, "Incorrect result of cleaning: column_name %s, to_page %d, pages_per_round %d, max_tupples_per_page %d.",$column_name, $last_to_page, $pages_per_round, $max_tupples_per_page);
         }
         _dbh->commit();
       } 
@@ -1086,7 +1090,7 @@ sub process {
       sleep($delay_ratio * (time - $start_time));
 
       if (time - $progress_report_time >= PROGRESS_REPORT_PERIOD && $last_to_page != $to_page) {
-        logger('quiet', "Progress: %s %d pages completed.", (defined $bloat_stats->{effective_page_count} ? int(100 * ($to_page ? ($initial_size_stats->{page_count} - $to_page - 1) / ($base->{stats}{page_count} - $bloat_stats->{effective_page_count}) : 1) ).'%, ' : ' '), ($base->{stats}{page_count} - $to_page - 1));
+        logger(LOG_WARNING, "Progress: %s %d pages completed.", (defined $bloat_stats->{effective_page_count} ? int(100 * ($to_page ? ($initial_size_stats->{page_count} - $to_page - 1) / ($table_info->{base_stats}{page_count} - $bloat_stats->{effective_page_count}) : 1) ).'%, ' : ' '), ($table_info->{stats}{page_count} - $to_page - 1));
         $progress_report_time = time;
       }
 
@@ -1096,7 +1100,7 @@ sub process {
       if ($routine_vacuum && $vacuum_page_count >= $pages_before_vacuum) {
         my $duration = $clean_pages_total_duration / ($last_loop - $loop);
         my $average_duration = $duration == 0 ? 0.0001 : $duration;
-        logger('quiet', "Cleaning in average: %.1f pages/second (%.3f seconds per %d pages).", ($pages_per_round / $average_duration), $duration, $pages_per_round);
+        logger(LOG_WARNING, "Cleaning in average: %.1f pages/second (%.3f seconds per %d pages).", ($pages_per_round / $average_duration), $duration, $pages_per_round);
         $clean_pages_total_duration = 0;
         $last_loop = $loop;
 
@@ -1104,36 +1108,36 @@ sub process {
         vacuum($schema_name, $table_name);
         
         if ($DBI::err) {
-          logger('quiet', "Table handling interrupt.");
+          logger(LOG_WARNING, "Table handling interrupt.");
           return -1;
         }
 
         $vacuum_time = time - $vacuum_time;
 
-        $stats = get_size_stats($schema_name, $table_name);
+        $table_info->{stats} = get_size_stats($schema_name, $table_name);
 
         if ($DBI::err) {
-         logger('quiet', "Table handling interrupt.");
+         logger(LOG_WARNING, "Table handling interrupt.");
           return -1;
         }
 
-        if ($stats->{page_count} > $to_page + 1) {
-          logger('quiet', "Vacuum routine: can not clean %d pages, %d pages left, duration %0.3f seconds.", ($stats->{page_count} - $to_page - 1), $stats->{page_count}, $vacuum_time);
+        if ($table_info->{stats}->{page_count} > $to_page + 1) {
+          logger(LOG_WARNING, "Vacuum routine: can not clean %d pages, %d pages left, duration %0.3f seconds.", ($table_info->{stats}->{page_count} - $to_page - 1), $table_info->{stats}->{page_count}, $vacuum_time);
         } else {
-          logger('quiet', "Vacuum routine: %d pages left, duration %.3f seconds.", ($stats->{page_count}||0), $vacuum_time);
+          logger(LOG_WARNING, "Vacuum routine: %d pages left, duration %.3f seconds.", ($table_info->{stats}->{page_count}||0), $vacuum_time);
         }
 
         $vacuum_page_count = 0;
 
         my $last_pages_before_vacuum = $pages_before_vacuum;
-        $pages_before_vacuum = get_pages_before_vacuum($stats->{page_count}, $expected_page_count); 
+        $pages_before_vacuum = get_pages_before_vacuum($table_info->{stats}->{page_count}, $expected_page_count); 
         if ($last_pages_before_vacuum != $pages_before_vacuum) {
-          logger('quiet', "Set pages/vacuum: %d.", $pages_before_vacuum);
+          logger(LOG_WARNING, "Set pages/vacuum: %d.", $pages_before_vacuum);
         }
       }
 
-      if ($to_page >= $stats->{page_count}) {
-        $to_page = $stats->{page_count} - 1;
+      if ($to_page >= $table_info->{stats}->{page_count}) {
+        $to_page = $table_info->{stats}->{page_count} - 1;
       }
 
       if ($to_page <= 1) {
@@ -1142,15 +1146,15 @@ sub process {
       }
 
       my $last_pages_per_round = $pages_per_round;
-      $pages_per_round = get_pages_per_round($stats->{page_count}, $to_page);
+      $pages_per_round = get_pages_per_round($table_info->{stats}->{page_count}, $to_page);
         
       if ($last_pages_per_round != $pages_per_round) {
-        logger('quiet', "Set pages/round: %d.",  $pages_per_round); 
+        logger(LOG_WARNING, "Set pages/round: %d.",  $pages_per_round); 
       }
     }
 
     if ($loop == 0) {
-      logger('quiet', "Maximum loops reached.");
+      logger(LOG_WARNING, "Maximum loops reached.");
     }
 
     if ($to_page > 0) {
@@ -1159,23 +1163,23 @@ sub process {
       vacuum($schema_name, $table_name);
 
       if ($DBI::err) {
-        logger('quiet', "Table handling interrupt.");
+        logger(LOG_WARNING, "Table handling interrupt.");
         return -1;
       }
 
       $vacuum_time = time - $vacuum_time;
 
-      $stats = get_size_stats($schema_name, $table_name);
+      $table_info->{stats} = get_size_stats($schema_name, $table_name);
 
       if ($DBI::err) {
-        logger('quiet', "Table handling interrupt.");
+        logger(LOG_WARNING, "Table handling interrupt.");
         return -1;
       }
  
-      if ($stats->{page_count} > $to_page + $pages_per_round) {
-        logger('quiet', "Vacuum final: can not clean %d pages, %d pages left, duration %0.3f seconds.", ($stats->{page_count} - $to_page - $pages_per_round), $stats->{page_count}, $vacuum_time);
+      if ($table_info->{stats}->{page_count} > $to_page + $pages_per_round) {
+        logger(LOG_WARNING, "Vacuum final: can not clean %d pages, %d pages left, duration %0.3f seconds.", ($table_info->{stats}->{page_count} - $to_page - $pages_per_round), $table_info->{stats}->{page_count}, $vacuum_time);
       } else {
-        logger('quiet', "Vacuum final: %d pages left, duration %.3f seconds.", ($stats->{page_count}||0), $vacuum_time);
+        logger(LOG_WARNING, "Vacuum final: %d pages left, duration %.3f seconds.", ($table_info->{stats}->{page_count}||0), $vacuum_time);
       }
     }
 
@@ -1184,33 +1188,33 @@ sub process {
     analyze($schema_name, $table_name);
 
     if ($DBI::err) {
-      logger('quiet', "Table handling interrupt.");
+      logger(LOG_WARNING, "Table handling interrupt.");
       return -1;
     }
 
     $analyze_time = time - $analyze_time;
-    logger('quiet', "Analyze final: duration %.3f second.", $analyze_time);
+    logger(LOG_WARNING, "Analyze final: duration %.3f second.", $analyze_time);
     #}
 
     my $get_stat_time = time;
     $bloat_stats = get_bloat_stats($schema_name, $table_name);
     
     if ($DBI::err) {
-      logger('quiet', "Table handling interrupt.");
+      logger(LOG_WARNING, "Table handling interrupt.");
       return -1;
     }
     
     $get_stat_time = time - $get_stat_time;
-    logger('quiet',"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time);
+    logger(LOG_WARNING,"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time);
 
-    $pages_before_vacuum = get_pages_before_vacuum($stats->{page_count}, $expected_page_count);
+    $pages_before_vacuum = get_pages_before_vacuum($table_info->{stats}->{page_count}, $expected_page_count);
 
-    $is_compacted = (($stats->{page_count} <= $to_page + 1 + $pages_before_vacuum) && !$expected_error_occurred); 
+    $is_compacted = (($table_info->{stats}->{page_count} <= $to_page + 1 + $pages_before_vacuum) && !$expected_error_occurred); 
   }
 
   my $will_be_skipped;
   
-  $will_be_skipped = (!$force && ($is_skipped || $stats->{page_count} < MINIMAL_COMPACT_PAGES || $bloat_stats->{free_percent} < MINIMAL_COMPACT_PERCENT))  unless ($is_locked);
+  $will_be_skipped = (!$force && ($is_skipped || $table_info->{stats}->{page_count} < MINIMAL_COMPACT_PAGES || $bloat_stats->{free_percent} < MINIMAL_COMPACT_PERCENT))  unless ($is_locked);
   
   my $is_reindexed;
 
@@ -1219,7 +1223,7 @@ sub process {
     my $index_data_list = get_index_data_list($schema_name, $table_name) || [];
     
     if ($DBI::err) {
-      logger('quiet', "Table handling interrupt.");
+      logger(LOG_WARNING, "Table handling interrupt.");
       return -1;
     }
 
@@ -1227,45 +1231,45 @@ sub process {
       my $initial_index_size_stats = get_index_size_statistics($schema_name, $index_data->{indexname});
       
       if (!$initial_index_size_stats || ref $initial_index_size_stats ne 'HASH') {
-        logger('quiet', "Can not get index size statistics.");
+        logger(LOG_WARNING, "Can not get index size statistics.");
         return;
       }
       
       if ($initial_index_size_stats->{page_count} <= 1) {
-        logger('quiet', "Skipping reindex: %s.%s, empty or 1 page index.", $schema_name, $index_data->{indexname});
+        logger(LOG_WARNING, "Skipping reindex: %s.%s, empty or 1 page index.", $schema_name, $index_data->{indexname});
         next;
       }
       
       my $index_bloat_stats;
       if (! $force) {
         if ($index_data->{indmethod} ne 'btree') {
-          logger('quiet', "Skipping reindex: %s.%s is a %s index not a btree, reindexing is up to you.", $schema_name, $index_data->{indexname}, $index_data->{indmethod}); 
-          logger('quiet', "Reindex queries: %s.%s, initial size %d pages (%s)", $schema_name, $index_data->{indexname}, $initial_index_size_stats->{page_count}, nice_size($initial_index_size_stats->{size}));
+          logger(LOG_WARNING, "Skipping reindex: %s.%s is a %s index not a btree, reindexing is up to you.", $schema_name, $index_data->{indexname}, $index_data->{indmethod}); 
+          logger(LOG_WARNING, "Reindex queries: %s.%s, initial size %d pages (%s)", $schema_name, $index_data->{indexname}, $initial_index_size_stats->{page_count}, nice_size($initial_index_size_stats->{size}));
           if ($index_data->{data}{allowed}) {
-            logger('quiet', "%s; --%s", get_reindex_query($index_data), $db_name);
-            logger('quiet', "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
+            logger(LOG_WARNING, "%s; --%s", get_reindex_query($index_data), $db_name);
+            logger(LOG_WARNING, "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
           } else {  
-            logger('quiet', "%s; --%s", get_straight_reindex_query($schema_name, $table_name, $index_data), $db_name);
+            logger(LOG_WARNING, "%s; --%s", get_straight_reindex_query($schema_name, $table_name, $index_data), $db_name);
           }       
           next;
         }
 
         if ($initial_index_size_stats->{page_count} < MINIMAL_COMPACT_PAGES) {
-          logger('quiet', "Skipping reindex: %s.%s, %d pages from %d pages minimum required.",$schema_name, $index_data->{indexname}, $initial_index_size_stats->{page_count}, MINIMAL_COMPACT_PAGES);
+          logger(LOG_WARNING, "Skipping reindex: %s.%s, %d pages from %d pages minimum required.",$schema_name, $index_data->{indexname}, $initial_index_size_stats->{page_count}, MINIMAL_COMPACT_PAGES);
           next;
         }
 
         $index_bloat_stats = get_index_bloat_stats($schema_name, $index_data->{indexname});
          
         if ($index_bloat_stats && ref $index_bloat_stats eq 'HASH' && $index_bloat_stats->{'free_percent'} < MINIMAL_COMPACT_PERCENT) {
-          logger('quiet', "Skipping reindex: %s.%s, %d%% space to compact from %d%% minimum required.", $schema_name, $index_data->{indexname}, $index_bloat_stats->{free_percent}, MINIMAL_COMPACT_PERCENT);
+          logger(LOG_WARNING, "Skipping reindex: %s.%s, %d%% space to compact from %d%% minimum required.", $schema_name, $index_data->{indexname}, $index_bloat_stats->{free_percent}, MINIMAL_COMPACT_PERCENT);
           next;
         }
       }
 
       if (not $index_data->{'allowed'}) {
-        logger('quiet', "Skipping reindex: %s.%s, can not reindex without heavy locks because of its dependencies, reindexing is up to you.", $schema_name, $index_data->{indexname});
-        logger('quiet', "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
+        logger(LOG_WARNING, "Skipping reindex: %s.%s, can not reindex without heavy locks because of its dependencies, reindexing is up to you.", $schema_name, $index_data->{indexname});
+        logger(LOG_WARNING, "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
            ($force ? ' forced' : ''),
            $schema_name, 
            $index_data->{indexname},
@@ -1274,8 +1278,8 @@ sub process {
            $index_bloat_stats->{free_percent},
            nice_size($index_bloat_stats->{free_space})
         );
-        logger('quiet', "%s; --%s", get_reindex_query($index_data), $db_name);
-        logger('quiet', "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
+        logger(LOG_WARNING, "%s; --%s", get_reindex_query($index_data), $db_name);
+        logger(LOG_WARNING, "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
 
         next;
       }
@@ -1285,7 +1289,7 @@ sub process {
         reindex($index_data);
         
         if($DBI::err) {
-          logger('quiet', "Skipping index %s: %s", $index_data->{indexname});
+          logger(LOG_WARNING, "Skipping index %s: %s", $index_data->{indexname});
           next;
         }
 
@@ -1305,7 +1309,7 @@ sub process {
               $locked_alter_attempt++;
               next;
             } else {
-              logger('quiet', $@);
+              logger(LOG_WARNING, $@);
               return;
             }
           } else {
@@ -1316,7 +1320,7 @@ sub process {
             my $new_stats = get_index_size_statistics($schema_name, $index_data->{indexname});
             my $free_percent = 100 * (1 - $new_stats->{size} / $initial_index_size_stats->{size});
             my $free_space = ($initial_index_size_stats->{size} - $new_stats->{size});
-            logger('quiet', "Reindex%s: %s.%s, initial size %d pages(%s), has been reduced by %d%% (%s), duration %d seconds, attempts %d.",
+            logger(LOG_WARNING, "Reindex%s: %s.%s, initial size %d pages(%s), has been reduced by %d%% (%s), duration %d seconds, attempts %d.",
               ($force ? " forced" : ""),
               $schema_name,
               $index_data->{indexname},
@@ -1333,7 +1337,7 @@ sub process {
           my $drop_index_time = time;
           drop_temp_index($schema_name);
           $reindex_time += time - $drop_index_time;
-          logger('quiet', "Reindex%s: %s.%s, lock has not been acquired, initial size %d pages(%d), , can be reduced by %d%% (%s), duration %d seconds.",
+          logger(LOG_WARNING, "Reindex%s: %s.%s, lock has not been acquired, initial size %d pages(%d), , can be reduced by %d%% (%s), duration %d seconds.",
             ($force ? " forced" : ""),
             $schema_name,
             $index_data->{indexname},
@@ -1348,7 +1352,7 @@ sub process {
       }
 
       if ($print_reindex_queries) {
-        logger('quiet', "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
+        logger(LOG_WARNING, "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
            ($force ? ' forced' : ''),
            $schema_name,
            $index_data->{indexname},
@@ -1357,16 +1361,16 @@ sub process {
            $index_bloat_stats->{free_percent},
            nice_size($index_bloat_stats->{free_space})
         );
-        logger('quiet', "%s; --%s", get_reindex_query($index_data), $db_name);
-        logger('quiet', "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
+        logger(LOG_WARNING, "%s; --%s", get_reindex_query($index_data), $db_name);
+        logger(LOG_WARNING, "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
       }
     }      
     
     if (!$no_reindex) {
-      $stats = get_size_stats($schema_name, $table_name);
+      $table_info->{stats} = get_size_stats($schema_name, $table_name);
     
       if ($DBI::err) {
-        logger('quiet', "Table handling interrupt.");
+        logger(LOG_WARNING, "Table handling interrupt.");
         return -1;
       }
     }
@@ -1375,27 +1379,27 @@ sub process {
   if (!$is_locked && !($is_skipped && !defined($is_reindexed))) {
     my $complete = (($is_compacted || $will_be_skipped || $is_skipped) && (defined $is_reindexed ? $is_reindexed : 1));
     if ($complete) {
-      logger('quiet', "Processing complete.");
+      logger(LOG_WARNING, "Processing complete.");
     } else {
-      logger('quiet', "Processing incomplete.");
+      logger(LOG_WARNING, "Processing incomplete.");
     }
 
-    if (defined $bloat_stats->{free_percent} && defined $bloat_stats->{effective_page_count} && $bloat_stats->{free_percent} > 0 && $stats->{page_count} > $bloat_stats->{effective_page_count} && !$complete) {
-      logger('quiet', "Processing results: %d pages left (%d pages including toasts and indexes), size reduced by %s (%s including toasts and indexes) in total , approximately %d%% (%d pages) that is %s more were expected to be compacted after this attempt.",
-        $stats->{page_count},
-        $stats->{total_page_count},
-        nice_size($base->{stats}{size}),
-        nice_size($base->{stats}{total_size}),
+    if (defined $bloat_stats->{free_percent} && defined $bloat_stats->{effective_page_count} && $bloat_stats->{free_percent} > 0 && $table_info->{stats}->{page_count} > $bloat_stats->{effective_page_count} && !$complete) {
+      logger(LOG_WARNING, "Processing results: %d pages left (%d pages including toasts and indexes), size reduced by %s (%s including toasts and indexes) in total , approximately %d%% (%d pages) that is %s more were expected to be compacted after this attempt.",
+        $table_info->{stats}->{page_count},
+        $table_info->{stats}->{total_page_count},
+        nice_size($table_info->{base_stats}{size} - $table_info->{stats}{size}),
+        nice_size($table_info->{base_stats}{total_size} - $table_info->{stats}{total_size}),
         $bloat_stats->{free_percent},
-        $stats->{page_count} - $bloat_stats->{effective_page_count},
+        $table_info->{stats}->{page_count} - $bloat_stats->{effective_page_count},
         nice_size($bloat_stats->{free_space})
       );
     } else {
-      logger('quiet', "Processing results: %d pages left (%d pages including toasts and indexes), size reduced by %s (%s including toasts and indexes) in total.",
-        $stats->{page_count},
-        $stats->{total_page_count},
-        nice_size($base->{stats}{size}),
-        nice_size($base->{stats}{total_size}),
+      logger(LOG_WARNING, "Processing results: %d pages left (%d pages including toasts and indexes), size reduced by %s (%s including toasts and indexes) in total.",
+        $table_info->{stats}->{page_count},
+        $table_info->{stats}->{total_page_count},
+        nice_size($table_info->{base_stats}{size} - $table_info->{stats}{size}),
+        nice_size($table_info->{base_stats}{total_size} - $table_info->{stats}{total_size}),
       );
     }
   }
@@ -1405,18 +1409,18 @@ sub process {
 
 #Main code
 
-if ($help) {
-  help;
+if ($show_version) {
+  show_version;
   exit(1);
 }
 
-if ($man) {
-  man;
+if ($show_help) {
+  show_help;
   exit(1);
 }
 
-if ($version) {
-  version;
+if ($show_man) {
+  show_man;
   exit(1);
 }
 
@@ -1430,13 +1434,13 @@ my @dbs = ($db_name);
 if($all_db) {
   $db_name = 'template1';
   unless(db_connect($db_name, $db_host, $db_port, $db_user, $db_passwd)) {
-    logger('quiet', "Cannot get database list. Quit.");
+    logger(LOG_WARNING, "Cannot get database list. Quit.");
     exit(0);
   }
   @dbs = 
   my $dbs = get_databases;
   unless ($dbs) {
-    logger('quiet', "Interrupt processing");
+    logger(LOG_WARNING, "Interrupt processing");
     exit(0);
   }
   @dbs = @$dbs;
@@ -1452,9 +1456,13 @@ if($exclude_table) {
   %excluded_tables = map {$_ => 1} split(/,/,$exclude_table);
 }
 
+my $databases_left;
 
 foreach my $current_db_name (@dbs) {
+  $table_info{$current_db_name} = {tables => {}, attempts => 0, size => 0, base_size => 0};
   $db_name = $current_db_name; 
+  my $tables_left;
+
   set_current_db_name($current_db_name);
   unset_current_schema_name_table_name;
   unless(db_connect($current_db_name, $db_host, $db_port, $db_user, $db_passwd)) {
@@ -1464,7 +1472,7 @@ foreach my $current_db_name (@dbs) {
   set_session_replication_role;
 
   if ($DBI::err) {
-    logger('quiet', "Database handling interrupt.");
+    logger(LOG_WARNING, "Database handling interrupt.");
     db_disconnect($current_db_name);
     next;
   }
@@ -1488,28 +1496,58 @@ foreach my $current_db_name (@dbs) {
 
   for (my $attempt = 0; $attempt < $max_retry_count; $attempt++) {
     logger('qiuet', "Handling tables. Attempt %s", ($attempt + 1));
+    
+    $table_info{$current_db_name}{attempts}++;
+    
     my @retry_idents = ();
 
     foreach my $current_ident (@$database_tables) {
+      my $table_key = $current_ident->{schemaname}.$current_ident->{tablename};
+      $table_info{$current_db_name}{tables}{$table_key} = {} unless ($table_info{$current_db_name}{tables}{$table_key} && ref $table_info{$current_db_name}{tables}{$table_key} eq 'HASH');
       next if (!$current_ident || ref $current_ident ne 'HASH' || $excluded_schemas{$current_ident->{schemaname}} || $excluded_tables{"$current_ident->{schemaname}.$current_ident->{tablename}"});
       set_current_schema_name_table_name($current_ident->{schemaname}, $current_ident->{tablename});
-      logger('quiet', "Start handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
-      $table_stats{$current_db_name.$current_ident->{schemaname}.$current_ident->{tablename}} = {} unless (ref $table_stats{$current_db_name.$current_ident->{schemaname}.$current_ident->{tablename}} eq 'HASH');
-      push @retry_idents, $current_ident unless process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt, $table_stats{$current_db_name.$current_ident->{schemaname}.$current_ident->{tablename}});
-      logger('quiet', "Finish handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
+      logger(LOG_WARNING, "Start handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
+      push @retry_idents, $current_ident unless process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt, $table_info{$current_db_name}{tables}{$table_key});
+      logger(LOG_WARNING, "Finish handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
     }
     
     if (scalar @retry_idents > 0) {
       @$database_tables = @retry_idents;
     } else {
+      undef $tables_left;
       last;
     }
+    
+    $tables_left = scalar(@retry_idents);
   }
 
   drop_clean_pages_function;
+
+  unset_current_schema_name_table_name;
+
+  $databases_left++ if ($tables_left);
+  logger(LOG_WARNING, "Processing %scomplete%s.", ($tables_left ? 'in' : ''), ($tables_left ? ": $tables_left tables left" : ''));
   
+  $table_info{$current_db_name}{size} = sum(map {$table_info{$current_db_name}{tables}{$_}{base_stats}{size} - $table_info{$current_db_name}{tables}{$_}{stats}{size}} keys(%{$table_info{$current_db_name}{tables}}));
+  $table_info{$current_db_name}{total_size} = sum(map {$table_info{$current_db_name}{tables}{$_}{base_stats}{total_size} - $table_info{$current_db_name}{tables}{$_}{stats}{total_size}} keys(%{$table_info{$current_db_name}{tables}}));
+  logger(LOG_WARNING, "Processing results: size reduced by %s (%s including toasts and indexes) in total.", nice_size($table_info{$current_db_name}{size}), nice_size($table_info{$current_db_name}{total_size}));
+
   db_disconnect($current_db_name);
 }
+
+unset_current_db_name;
+
+if($databases_left) {
+  logger(LOG_WARNING, "Processing incomplete: %d databases left.'", $databases_left);
+} else {
+  logger(LOG_WARNING, "Processing complete: %d retries to process have been done", sum(map {$table_info{$_}{attempts}} keys(%table_info)));
+}
+  
+logger(LOG_WARNING, "Processing results: size reduced by %s (%s including toasts and indexes) in total, %s.", 
+  nice_size(sum(map {$table_info{$_}{size}} keys(%table_info))),
+  nice_size(sum(map {$table_info{$_}{total_size}} keys(%table_info))),
+  join(', ', map {nice_size($table_info{$_}{size})." (".nice_size($table_info{$_}{total_size}).") $_"} keys(%table_info))
+); 
 
 1;
 
