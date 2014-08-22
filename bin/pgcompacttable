@@ -1424,7 +1424,7 @@ if ($show_man) {
   exit(1);
 }
 
-unless (($db_name && $table_name) || $all_db) {
+unless ($db_name || $table_name || $all_db) {
   not_enough_arguments();
   exit(1);
 }
