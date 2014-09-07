@@ -173,6 +173,7 @@ sub logger {
 sub nice_size
 {
   my $size = shift;
+  $size = 0 unless ($size);
   my @sizes = qw/B KB MB GB TB PB/;
 
   my $i = 0;
@@ -866,7 +867,8 @@ sub alter_index {
     _dbh->do("$sql;");
 
     if ($DBI::err) {
-      logger(LOG_ERROR, "SQL Error: %s", $DBI::err);
+      logger(LOG_ERROR, "SQL Error: %s", $DBI::errstr);
+      _dbh->rollback;
       return undef;
     }
 
@@ -928,9 +930,9 @@ sub process {
       return -1;
     }
 
-    logger(LOG_NOTICE, "Vacuum initial: %d pages left, duration %.3f seconds.", ($table_info->{stats}->{page_count}||0), $vacuum_time);
+    logger(LOG_NOTICE, "Vacuum initial: %d pages left, duration %.3f seconds.", ($table_info->{stats}{page_count}||0), $vacuum_time);
 
-    if($table_info->{stats}->{page_count} <= 1) {
+    if($table_info->{stats}{page_count} <= 1) {
       logger(LOG_NOTICE, "Skipping processing: empty or 1 page table.");
       $is_skipped = 1;
     }
@@ -979,19 +981,19 @@ sub process {
     }
   }
   if (!$is_locked && !$is_skipped) {
-    my $can_be_compacted = ($bloat_stats->{'free_percent'} > 0 && ($table_info->{stats}->{page_count} > $bloat_stats->{effective_page_count}));
+    my $can_be_compacted = ($bloat_stats->{'free_percent'} > 0 && ($table_info->{stats}{page_count} > $bloat_stats->{effective_page_count}));
     if ($can_be_compacted) {
       logger(LOG_WARNING, "Statistics: %d pages (%d pages including toasts and indexes) , approximately %0.3f%% (%d pages) can be compacted reducing the size by %s.",
-        $table_info->{stats}->{page_count},
-        $table_info->{stats}->{total_page_count},
+        $table_info->{stats}{page_count},
+        $table_info->{stats}{total_page_count},
         $bloat_stats->{'free_percent'},
-        ($table_info->{stats}->{page_count} - $bloat_stats->{effective_page_count}),
+        ($table_info->{stats}{page_count} - $bloat_stats->{effective_page_count}),
         nice_size($bloat_stats->{free_space})
       );
     } else {
       logger(LOG_WARNING, "Statistics: %d pages (%d pages including toasts and indexes)",
-        $table_info->{stats}->{page_count},
-        $table_info->{stats}->{total_page_count}
+        $table_info->{stats}{page_count},
+        $table_info->{stats}{total_page_count}
       );
     }
 
@@ -1007,8 +1009,8 @@ sub process {
     }
 
     if(!$force) {      
-      if($table_info->{stats}->{page_count} < MINIMAL_COMPACT_PAGES) {
-        logger(LOG_NOTICE,"Skipping processing: %d pages from %d pages minimum required.'", $table_info->{stats}->{page_count}, MINIMAL_COMPACT_PAGES);
+      if($table_info->{stats}{page_count} < MINIMAL_COMPACT_PAGES) {
+        logger(LOG_NOTICE,"Skipping processing: %d pages from %d pages minimum required.'", $table_info->{stats}{page_count}, MINIMAL_COMPACT_PAGES);
         $is_skipped = 1;
       }
       if(($bloat_stats->{free_percent}||0) <= MINIMAL_COMPACT_PERCENT) {
@@ -1024,13 +1026,13 @@ sub process {
     logger(LOG_WARNING, "Processing forced.") if ($force);
     my $vacuum_page_count = 0;
     my $initial_size_stats = {%{$table_info->{stats}}};
-    my $to_page = $table_info->{stats}->{page_count} - 1;
+    my $to_page = $table_info->{stats}{page_count} - 1;
     my $progress_report_time = time;
     my $clean_pages_total_duration = 0;
-    my $last_loop = $table_info->{stats}->{page_count} + 1;
+    my $last_loop = $table_info->{stats}{page_count} + 1;
     my $expected_error_occurred = 0;
 
-    my $expected_page_count = $table_info->{stats}->{page_count};
+    my $expected_page_count = $table_info->{stats}{page_count};
     my $column_name = get_update_column($schema_name, $table_name);
 
     if ($DBI::err) {
@@ -1038,8 +1040,8 @@ sub process {
       return -1;
     }
 
-    my $pages_per_round = get_pages_per_round($table_info->{stats}->{page_count}, $to_page);
-    my $pages_before_vacuum = get_pages_before_vacuum($table_info->{stats}->{page_count}, $expected_page_count);
+    my $pages_per_round = get_pages_per_round($table_info->{stats}{page_count}, $to_page);
+    my $pages_before_vacuum = get_pages_before_vacuum($table_info->{stats}{page_count}, $expected_page_count);
 
     my $max_tupples_per_page = get_max_tupples_per_page($schema_name, $table_name);
 
@@ -1055,7 +1057,7 @@ sub process {
     my $start_time;
     my $last_to_page;
     my $loop;
-    for ($loop = $table_info->{stats}->{page_count}; $loop > 0; $loop--) {
+    for ($loop = $table_info->{stats}{page_count}; $loop > 0; $loop--) {
       $start_time = time;
       _dbh->begin_work;
       $last_to_page = $to_page;
@@ -1122,23 +1124,23 @@ sub process {
           return -1;
         }
 
-        if ($table_info->{stats}->{page_count} > $to_page + 1) {
-          logger(LOG_NOTICE, "Vacuum routine: can not clean %d pages, %d pages left, duration %0.3f seconds.", ($table_info->{stats}->{page_count} - $to_page - 1), $table_info->{stats}->{page_count}, $vacuum_time);
+        if ($table_info->{stats}{page_count} > $to_page + 1) {
+          logger(LOG_NOTICE, "Vacuum routine: can not clean %d pages, %d pages left, duration %0.3f seconds.", ($table_info->{stats}{page_count} - $to_page - 1), $table_info->{stats}{page_count}, $vacuum_time);
         } else {
-          logger(LOG_NOTICE, "Vacuum routine: %d pages left, duration %.3f seconds.", ($table_info->{stats}->{page_count}||0), $vacuum_time);
+          logger(LOG_NOTICE, "Vacuum routine: %d pages left, duration %.3f seconds.", ($table_info->{stats}{page_count}||0), $vacuum_time);
         }
 
         $vacuum_page_count = 0;
 
         my $last_pages_before_vacuum = $pages_before_vacuum;
-        $pages_before_vacuum = get_pages_before_vacuum($table_info->{stats}->{page_count}, $expected_page_count); 
+        $pages_before_vacuum = get_pages_before_vacuum($table_info->{stats}{page_count}, $expected_page_count); 
         if ($last_pages_before_vacuum != $pages_before_vacuum) {
           logger(LOG_WARNING, "Set pages/vacuum: %d.", $pages_before_vacuum);
         }
       }
 
-      if ($to_page >= $table_info->{stats}->{page_count}) {
-        $to_page = $table_info->{stats}->{page_count} - 1;
+      if ($to_page >= $table_info->{stats}{page_count}) {
+        $to_page = $table_info->{stats}{page_count} - 1;
       }
 
       if ($to_page <= 1) {
@@ -1147,7 +1149,7 @@ sub process {
       }
 
       my $last_pages_per_round = $pages_per_round;
-      $pages_per_round = get_pages_per_round($table_info->{stats}->{page_count}, $to_page);
+      $pages_per_round = get_pages_per_round($table_info->{stats}{page_count}, $to_page);
         
       if ($last_pages_per_round != $pages_per_round) {
         logger(LOG_WARNING, "Set pages/round: %d.",  $pages_per_round); 
@@ -1177,10 +1179,10 @@ sub process {
         return -1;
       }
  
-      if ($table_info->{stats}->{page_count} > $to_page + $pages_per_round) {
-        logger(LOG_NOTICE, "Vacuum final: cannot clean %d pages, %d pages left, duration %0.3f seconds.", ($table_info->{stats}->{page_count} - $to_page - $pages_per_round), $table_info->{stats}->{page_count}, $vacuum_time);
+      if ($table_info->{stats}{page_count} > $to_page + $pages_per_round) {
+        logger(LOG_NOTICE, "Vacuum final: cannot clean %d pages, %d pages left, duration %0.3f seconds.", ($table_info->{stats}{page_count} - $to_page - $pages_per_round), $table_info->{stats}{page_count}, $vacuum_time);
       } else {
-        logger(LOG_NOTICE, "Vacuum final: %d pages left, duration %.3f seconds.", ($table_info->{stats}->{page_count}||0), $vacuum_time);
+        logger(LOG_NOTICE, "Vacuum final: %d pages left, duration %.3f seconds.", ($table_info->{stats}{page_count}||0), $vacuum_time);
       }
     }
 
@@ -1208,14 +1210,14 @@ sub process {
     $get_stat_time = time - $get_stat_time;
     logger(LOG_NOTICE,"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time);
 
-    $pages_before_vacuum = get_pages_before_vacuum($table_info->{stats}->{page_count}, $expected_page_count);
+    $pages_before_vacuum = get_pages_before_vacuum($table_info->{stats}{page_count}, $expected_page_count);
 
-    $is_compacted = (($table_info->{stats}->{page_count} <= $to_page + 1 + $pages_before_vacuum) && !$expected_error_occurred); 
+    $is_compacted = (($table_info->{stats}{page_count} <= $to_page + 1 + $pages_before_vacuum) && !$expected_error_occurred); 
   }
 
   my $will_be_skipped;
   
-  $will_be_skipped = (!$force && ($is_skipped || $table_info->{stats}->{page_count} < MINIMAL_COMPACT_PAGES || $bloat_stats->{free_percent} < MINIMAL_COMPACT_PERCENT))  unless ($is_locked);
+  $will_be_skipped = (!$force && ($is_skipped || $table_info->{stats}{page_count} < MINIMAL_COMPACT_PAGES || $bloat_stats->{free_percent} < MINIMAL_COMPACT_PERCENT))  unless ($is_locked);
   
   my $is_reindexed;
 
@@ -1378,20 +1380,20 @@ sub process {
       logger(LOG_NOTICE, "Processing incomplete.");
     }
 
-    if (defined $bloat_stats->{free_percent} && defined $bloat_stats->{effective_page_count} && $bloat_stats->{free_percent} > 0 && $table_info->{stats}->{page_count} > $bloat_stats->{effective_page_count} && !$complete) {
+    if (defined $bloat_stats->{free_percent} && defined $bloat_stats->{effective_page_count} && $bloat_stats->{free_percent} > 0 && $table_info->{stats}{page_count} > $bloat_stats->{effective_page_count} && !$complete) {
       logger(LOG_WARNING, "Processing results: %d pages left (%d pages including toasts and indexes), size reduced by %s (%s including toasts and indexes) in total , approximately %d%% (%d pages) that is %s more were expected to be compacted after this attempt.",
-        $table_info->{stats}->{page_count},
-        $table_info->{stats}->{total_page_count},
+        $table_info->{stats}{page_count},
+        $table_info->{stats}{total_page_count},
         nice_size($table_info->{base_stats}{size} - $table_info->{stats}{size}),
         nice_size($table_info->{base_stats}{total_size} - $table_info->{stats}{total_size}),
         $bloat_stats->{free_percent},
-        $table_info->{stats}->{page_count} - $bloat_stats->{effective_page_count},
+        $table_info->{stats}{page_count} - $bloat_stats->{effective_page_count},
         nice_size($bloat_stats->{free_space})
       );
     } else {
       logger(LOG_WARNING, "Processing results: %d pages left (%d pages including toasts and indexes), size reduced by %s (%s including toasts and indexes) in total.",
-        $table_info->{stats}->{page_count},
-        $table_info->{stats}->{total_page_count},
+        $table_info->{stats}{page_count},
+        $table_info->{stats}{total_page_count},
         nice_size($table_info->{base_stats}{size} - $table_info->{stats}{size}),
         nice_size($table_info->{base_stats}{total_size} - $table_info->{stats}{total_size}),
       );
