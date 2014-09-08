@@ -776,13 +776,21 @@ sub get_alter_index_query {
 
   my $constraint_ident = _dbh->quote_identifier($index_data->{conname}) if ($index_data && ref $index_data eq 'HASH' && $index_data->{conname});
 
-  return
-    "BEGIN; SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . "; 
-    " . ($constraint_ident ?
-      ("ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name) . " DROP CONSTRAINT $constraint_ident;
-ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name) . " ADD CONSTRAINT $constraint_ident $index_data->{contypedef} USING INDEX pgcompact_index_$$;") :
-      ("DROP INDEX " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($index_data->{indexname}) . "; ALTER INDEX " . _dbh->quote_identifier($schema_name) . ".pgcompact_index_$$ RENAME TO " . _dbh->quote_identifier($index_data->{indexname}) . ";")
-    )."END;";
+  if($constraint_ident) {
+    return 
+    "BEGIN; SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . ";
+ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name) . " DROP CONSTRAINT $constraint_ident;
+ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name) . " ADD CONSTRAINT $constraint_ident $index_data->{contypedef} USING INDEX pgcompact_index_$$;
+END;";
+  } else {
+    my $tmp_index_name = "tmp_".int(rand(1000000000));
+    return
+    "BEGIN; SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . ";
+ALTER INDEX " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($index_data->{indexname}) . " RENAME TO " . _dbh->quote_identifier($tmp_index_name) . ";
+ALTER INDEX " . _dbh->quote_identifier($schema_name) . ".pgcompact_index_$$ RENAME TO " . _dbh->quote_identifier($index_data->{indexname}) . ";
+END;
+DROP INDEX " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($tmp_index_name) . ";";
+  }
 }
 
 sub get_straight_reindex_query {
@@ -868,7 +876,7 @@ sub alter_index {
 
     if ($DBI::err) {
       logger(LOG_ERROR, "SQL Error: %s", $DBI::errstr);
-      _dbh->rollback;
+      _dbh->do("END;");
       return undef;
     }
 
