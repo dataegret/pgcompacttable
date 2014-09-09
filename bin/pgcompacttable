@@ -178,7 +178,7 @@ sub nice_size
 
   my $i = 0;
 
-  while ($size > 1024) {
+  while (abs($size) > 1024) {
     $size = $size / 1024;
     $i++;
   }
@@ -331,10 +331,10 @@ sub get_bloat_stats {
 
   my $sth = _dbh->prepare("SELECT
     ceil((size - free_space) * 100 / fillfactor / bs) AS effective_page_count,
-    round(
-        (100 * (1 - (100 - free_percent) / fillfactor))::numeric, 2
-    ) AS free_percent,
-    ceil(size - (size - free_space) * 100 / fillfactor) AS free_space
+            greatest(round(
+                (100 * (1 - (100 - free_percent) / fillfactor))::numeric, 2
+            ),0) AS free_percent,
+            greatest(ceil(size - (size - free_space) * 100 / fillfactor), 0) AS free_space
     FROM (
     SELECT
         current_setting('block_size')::integer AS bs,
