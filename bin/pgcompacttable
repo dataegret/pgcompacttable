@@ -64,8 +64,10 @@ my $max_retry_count = 10;
 
 my $all_db;
 
+my $only_schema;
 my $exclude_schema;
 my $exclude_table;
+my %only_schemas;
 my %excluded_schemas;
 my %excluded_tables;
 
@@ -82,7 +84,7 @@ unless (GetOptions(
             'U|user=s' => \$db_user,
             'W|password=s' => \$db_passwd,
             'd|dbname=s' => \$db_name,
-            'n|schema=s' => \$schema_name,
+            'n|schema=s' => \$only_schema,
             't|table=s' => \$table_name,
             'v|verbose' => \$verbose,
             'q|quiet' => \$quiet,
@@ -99,6 +101,7 @@ unless (GetOptions(
  show_usage();
  exit(0);
 }
+
 my $_verbosity = ($verbose ? LOG_NOTICE : ($quiet ? LOG_ERROR : LOG_WARNING));
 
 our $_current_db_name;
@@ -1452,6 +1455,11 @@ if($all_db) {
   db_disconnect;
 }
 
+if($only_schema) {
+  %only_schemas = map {$_ => 1} split(/,/,$only_schema);
+  $schema_name = $only_schema if (scalar(keys(%only_schemas)) == 1);
+}
+
 if($exclude_schema) {
   %excluded_schemas = map {$_ => 1} split(/,/,$exclude_schema);
 }
@@ -1498,11 +1506,13 @@ foreach my $current_db_name (@dbs) {
   }
 
   my $database_tables = ($schema_name && $table_name) ? [{schemaname => $schema_name, tablename => $table_name}] : get_database_tables($current_db_name);
+
   unless($database_tables && ref $database_tables eq 'ARRAY' && scalar(@$database_tables) > 0) {
     logger('qiuet', "Skip handling database %s: cannot find tables", $current_db_name);
   }
 
   for (my $attempt = 0; $attempt < $max_retry_count; $attempt++) {
+    
     logger('qiuet', "Handling tables. Attempt %s", ($attempt + 1));
     
     $table_info{$current_db_name}{attempts}++;
@@ -1510,10 +1520,10 @@ foreach my $current_db_name (@dbs) {
     my @retry_idents = ();
 
     foreach my $current_ident (@$database_tables) {
+      next if (!$current_ident || ref $current_ident ne 'HASH' || $excluded_schemas{$current_ident->{schemaname}} || ($only_schema && !$only_schemas{$current_ident->{schemaname}}) || $excluded_tables{"$current_ident->{schemaname}.$current_ident->{tablename}"});
       my $table_key = $current_ident->{schemaname}.$current_ident->{tablename};
       $table_info{$current_db_name}{tables}{$table_key} = {} unless ($table_info{$current_db_name}{tables}{$table_key} && ref $table_info{$current_db_name}{tables}{$table_key} eq 'HASH');
       $is_something_processed = 1 unless ($is_something_processed);
-      next if (!$current_ident || ref $current_ident ne 'HASH' || $excluded_schemas{$current_ident->{schemaname}} || $excluded_tables{"$current_ident->{schemaname}.$current_ident->{tablename}"});
       set_current_schema_name_table_name($current_ident->{schemaname}, $current_ident->{tablename});
       logger(LOG_NOTICE, "Start handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
       push @retry_idents, $current_ident unless process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt, $table_info{$current_db_name}{tables}{$table_key});
