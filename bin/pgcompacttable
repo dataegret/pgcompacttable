@@ -13,7 +13,7 @@ use DBI;
 
 use Data::Dumper;
 
-our $VERSION = '1.0RC';
+our $VERSION = '1.0.1';
 
 local $| = 1;
 select(STDOUT);
@@ -900,6 +900,10 @@ sub drop_temp_index {
   return;
 }
 
+sub get_pg_backend_pid {
+  my ($backend_pid) = _dbh->selectrow_array("select pg_backend_pid();");
+  return $backend_pid;
+}
 #Process function
 
 sub process {
@@ -1483,6 +1487,30 @@ foreach my $current_db_name (@dbs) {
     next;
   }
 
+  my $ionice_made = undef;
+
+  my $backend_pid = get_pg_backend_pid();
+  if ($backend_pid) {
+    my $user_login = $ENV{LOGNAME} || $ENV{USER} || getpwuid($<);
+    if ($user_login eq 'postgres' || $user_login eq 'root') {
+      my $errstr = `ionice -c 3 -p $backend_pid 2>/dev/stdout`;
+      if ($errstr) {
+        chomp $errstr;
+        logger(LOG_WARNING, "Cannot set ionice 3 for the process. It is recomennded to set ionice -c 3 for pgcompacttable. Error: %s", $errstr);
+      } else {
+        $ionice_made = 1;
+      }
+    }
+    logger(LOG_WARNING, "Postgress backend pid: $backend_pid") if ($backend_pid && $backend_pid =~/^\d+$/ && $backend_pid > 0);
+  } else {
+    logger(LOG_ERROR, "Cannot get backend pid from Postgres. Exitting...");
+    exit(-1);
+  }
+
+  unless ($ionice_made) {
+    logger(LOG_WARNING, "It is recomennded to set ionice -c 3 for pgcompacttable: ionice -c 3 -p %d", $backend_pid);
+  }
+
   set_session_replication_role;
 
   if ($DBI::err) {
@@ -1655,13 +1683,13 @@ Print version.
 
 =item B<--quiet>
 
-Verbose mode. Display all the progress messages.
+Quiet mode. Do not display any messages exept error messages and total result.
 
 =item B<-v>
 
 =item B<--verbose>
 
-Quiet mode. Do not display any messages exept error messages and total result.
+Verbose mode. Display all the progress messages.
 
 =item B<-q>
 
