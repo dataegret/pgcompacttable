@@ -71,6 +71,8 @@ my %only_schemas;
 my %excluded_schemas;
 my %excluded_tables;
 
+my $initial_reindex;
+
 my %table_info;
 
 unless (GetOptions(
@@ -97,6 +99,7 @@ unless (GetOptions(
             'a|all' => \$all_db,
             'N|exclude-schema=s' => \$exclude_schema,
             'T|exclude-table=s' => \$exclude_table,
+            'i|initial-reindex' => \$initial_reindex
           )) {
  show_usage();
  exit(0);
@@ -110,6 +113,11 @@ our $_current_table_name;
 
 sub not_enough_arguments {
   logger(LOG_ALWAYS, "%s: At least one of the options must be specified: all, dbname", $0);
+  logger('quit', "Use --help for short help, --man for full manual.");
+}
+
+sub no_together_arguments {
+  logger(LOG_ALWAYS, "%s: These options cannot be specified together at once: %s", $0, join(', ', @_));
   logger('quit', "Use --help for short help, --man for full manual.");
 }
 
@@ -333,11 +341,11 @@ sub get_bloat_stats {
   return undef unless($pgstattuple_schema_name);
 
   my $sth = _dbh->prepare("SELECT
-    ceil((size - free_space) * 100 / fillfactor / bs) AS effective_page_count,
+    ceil((size - free_space - dead_tuple_len) * 100 / fillfactor / bs) AS effective_page_count,
             greatest(round(
-                (100 * (1 - (100 - free_percent) / fillfactor))::numeric, 2
+                (100 * (1 - (100 - free_percent - dead_tuple_percent) / fillfactor))::numeric, 2
             ),0) AS free_percent,
-            greatest(ceil(size - (size - free_space) * 100 / fillfactor), 0) AS free_space
+            greatest(ceil(size - (size - free_space - dead_tuple_len) * 100 / fillfactor), 0) AS free_space
     FROM (
     SELECT
         current_setting('block_size')::integer AS bs,
@@ -792,7 +800,7 @@ END;";
 ALTER INDEX " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($index_data->{indexname}) . " RENAME TO " . _dbh->quote_identifier($tmp_index_name) . ";
 ALTER INDEX " . _dbh->quote_identifier($schema_name) . ".pgcompact_index_$$ RENAME TO " . _dbh->quote_identifier($index_data->{indexname}) . ";
 END;
-DROP INDEX " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($tmp_index_name) . ";";
+DROP INDEX CONCURRENTLY " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($tmp_index_name) . ";";
   }
 }
 
@@ -890,7 +898,7 @@ sub drop_temp_index {
   my $schema_name = shift;
 
   _dbh->do("SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . ";"); 
-  _dbh->do("DROP INDEX ?;", undef, "$schema_name.pgcompact_index_$$");
+  _dbh->do("DROP INDEX CONCURRENTLY ?;", undef, "$schema_name.pgcompact_index_$$");
 
   if ($DBI::err) {
     logger(LOG_ERROR, "SQL Error: %s", $DBI::err);
@@ -904,6 +912,158 @@ sub get_pg_backend_pid {
   my ($backend_pid) = _dbh->selectrow_array("select pg_backend_pid();");
   return $backend_pid;
 }
+
+sub reindex_table {
+  my $table_name = shift;
+  my $schema_name = shift;
+  my $db_name = shift;
+  my $print_reindex_queries = shift;
+
+  my $is_reindexed;
+
+  my $index_data_list = get_index_data_list($schema_name, $table_name) || [];
+
+  if ($DBI::err) {
+    logger(LOG_ERROR, "Table handling interrupt.");
+    return -1;
+  }
+
+  for my $index_data (@$index_data_list) {
+    my $initial_index_size_stats = get_index_size_statistics($schema_name, $index_data->{indexname});
+
+    if (!$initial_index_size_stats || ref $initial_index_size_stats ne 'HASH') {
+      logger(LOG_ERROR, "Cannot get index size statistics.");
+      return;
+    }
+
+    if ($initial_index_size_stats->{page_count} <= 1) {
+      logger(LOG_NOTICE, "Skipping reindex: %s.%s, empty or 1 page index.", $schema_name, $index_data->{indexname});
+      next;
+    }
+
+    my $index_bloat_stats;
+    
+    if (! $force) {
+      if ($index_data->{indmethod} ne 'btree') {
+        logger(LOG_NOTICE, "Skipping reindex: %s.%s is a %s index not a btree, reindexing is up to you.", $schema_name, $index_data->{indexname}, $index_data->{indmethod});
+        logger(LOG_WARNING, "Reindex queries: %s.%s, initial size %d pages (%s)", $schema_name, $index_data->{indexname}, $initial_index_size_stats->{page_count}, nice_size($initial_index_size_stats->{size}));
+        if ($index_data->{data}{allowed}) {
+          logger(LOG_WARNING, "%s; --%s", get_reindex_query($index_data), $db_name);
+          logger(LOG_WARNING, "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
+        } else {
+          logger(LOG_WARNING, "%s; --%s", get_straight_reindex_query($schema_name, $table_name, $index_data), $db_name);
+        }
+        next;
+      }
+
+      if ($initial_index_size_stats->{page_count} < MINIMAL_COMPACT_PAGES) {
+        logger(LOG_NOTICE, "Skipping reindex: %s.%s, %d pages from %d pages minimum required.",$schema_name, $index_data->{indexname}, $initial_index_size_stats->{page_count}, MINIMAL_COMPACT_PAGES);
+        next;
+      }
+
+      $index_bloat_stats = get_index_bloat_stats($schema_name, $index_data->{indexname});
+
+      if ($index_bloat_stats && ref $index_bloat_stats eq 'HASH' && $index_bloat_stats->{'free_percent'} < MINIMAL_COMPACT_PERCENT) {
+        logger(LOG_NOTICE, "Skipping reindex: %s.%s, %d%% space to compact from %d%% minimum required.", $schema_name, $index_data->{indexname}, $index_bloat_stats->{free_percent}, MINIMAL_COMPACT_PERCENT);
+        next;
+      }
+    }
+
+    if (not $index_data->{'allowed'}) {
+      logger(LOG_NOTICE, "Skipping reindex: %s.%s, can not reindex without heavy locks because of its dependencies, reindexing is up to you.", $schema_name, $index_data->{indexname});
+      logger(LOG_WARNING, "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
+         ($force ? ' forced' : ''),
+         $schema_name,
+         $index_data->{indexname},
+         $initial_index_size_stats->{page_count},
+         nice_size($initial_index_size_stats->{size}),
+         $index_bloat_stats->{free_percent},
+         nice_size($index_bloat_stats->{free_space})
+      );
+      logger(LOG_WARNING, "%s; --%s", get_reindex_query($index_data), $db_name);
+      logger(LOG_WARNING, "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
+
+      next;
+    }
+
+    if (!$no_reindex) {
+      my $start_reindex_time = time;
+      reindex($index_data);
+
+      if($DBI::err) {
+        logger(LOG_NOTICE, "Skipping index %s: %s", $index_data->{indexname});
+        next;
+      }
+
+      my $reindex_time = time - $start_reindex_time;
+
+      my $locked_alter_attempt = 0;
+      while ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
+        unless(defined(alter_index($schema_name, $table_name, $index_data))) {
+          if ($DBI::errstr && $DBI::errstr =~ 'canceling statement due to statement timeout') {
+            $locked_alter_attempt++;
+            next;
+          } else {
+            logger(LOG_ERROR, $@);
+            return;
+          }
+        };
+        $reindex_time = time - $start_reindex_time;
+        last;
+      }
+      if ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
+          my $new_stats = get_index_size_statistics($schema_name, $index_data->{indexname});
+          my $free_percent = 100 * (1 - $new_stats->{size} / $initial_index_size_stats->{size});
+          my $free_space = ($initial_index_size_stats->{size} - $new_stats->{size});
+          logger(LOG_WARNING, "Reindex%s: %s.%s, initial size %d pages(%s), has been reduced by %d%% (%s), duration %d seconds, attempts %d.",
+            ($force ? " forced" : ""),
+            $schema_name,
+            $index_data->{indexname},
+            $initial_index_size_stats->{page_count},
+            nice_size($initial_index_size_stats->{size}),
+            int($free_percent),
+            nice_size($free_space),
+            $reindex_time,
+            $locked_alter_attempt
+          );
+        $is_reindexed = (defined $is_reindexed) ? ($is_reindexed and 1) : 1;
+      } else {
+        my $drop_index_time = time;
+        drop_temp_index($schema_name);
+        $reindex_time += time - $drop_index_time;
+        logger(LOG_WARNING, "Reindex%s: %s.%s, lock has not been acquired, initial size %d pages(%d)",#, can be reduced by %d%% (%s), duration %d seconds.",
+          ($force ? " forced" : ""),
+          $schema_name,
+          $index_data->{indexname},
+          $initial_index_size_stats->{page_count},
+          nice_size($initial_index_size_stats->{size}),
+          #$bloat_stats->{free_percent},
+          #nice_size($bloat_stats->{free_space}),
+          #$reindex_time
+        );
+        $is_reindexed = 0;
+      }
+    }
+
+    if ($print_reindex_queries) {
+      logger(LOG_WARNING, "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
+        ($force ? ' forced' : ''),
+        $schema_name,
+        $index_data->{indexname},
+        $initial_index_size_stats->{page_count},
+        nice_size($initial_index_size_stats->{size}),
+        ($index_bloat_stats->{free_percent}||0),
+        nice_size($index_bloat_stats->{free_space})
+      );
+
+      logger(LOG_WARNING, "%s; --%s", get_reindex_query($index_data), $db_name);
+      logger(LOG_WARNING, "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
+    }
+  }
+  
+  return $is_reindexed;
+}
+
 #Process function
 
 sub process {
@@ -954,8 +1114,13 @@ sub process {
   }
 
   my $bloat_stats;
-
+  my $is_reindexed;
   if (!$is_locked && !$is_skipped) {
+    
+    if ($initial_reindex && !$no_reindex && defined($attempt) && $attempt == 0) {
+      $is_reindexed = reindex_table($table_name, $schema_name, $db_name);
+    }
+
     my $get_stat_time = time;
     $bloat_stats = get_bloat_stats($schema_name, $table_name);
 
@@ -995,6 +1160,7 @@ sub process {
       }
     }
   }
+
   if (!$is_locked && !$is_skipped) {
     my $can_be_compacted = ($bloat_stats->{'free_percent'} > 0 && ($table_info->{stats}{page_count} > $bloat_stats->{effective_page_count}));
     if ($can_be_compacted) {
@@ -1035,8 +1201,6 @@ sub process {
     }
   }
 
-  my $is_compacted;
-  
   if (!$is_locked && !$is_skipped) {
     logger(LOG_WARNING, "Processing forced.") if ($force);
     my $vacuum_page_count = 0;
@@ -1226,157 +1390,14 @@ sub process {
     logger(LOG_NOTICE,"Bloat statistics with pgstattuple: duration %.3f seconds.", $get_stat_time);
 
     $pages_before_vacuum = get_pages_before_vacuum($table_info->{stats}{page_count}, $expected_page_count);
-
-    $is_compacted = (($table_info->{stats}{page_count} <= $to_page + 1 + $pages_before_vacuum) && !$expected_error_occurred); 
   }
 
-  my $will_be_skipped;
+  my $will_be_skipped = (!$is_locked && ($is_skipped || $table_info->{stats}{page_count} < MINIMAL_COMPACT_PAGES || $bloat_stats->{free_percent} < MINIMAL_COMPACT_PERCENT));
   
-  $will_be_skipped = (!$force && ($is_skipped || $table_info->{stats}{page_count} < MINIMAL_COMPACT_PAGES || $bloat_stats->{free_percent} < MINIMAL_COMPACT_PERCENT))  unless ($is_locked);
-  
-  my $is_reindexed;
-
-  if (!$is_locked && ( $is_compacted || $attempt == $max_retry_count || $is_skipped || (!$is_skipped && $will_be_skipped)) && (!$no_reindex || $print_reindex_queries)) {
+  if (!$is_locked && ($print_reindex_queries || (!$no_reindex && (!$is_skipped || ($attempt == $max_retry_count) || (!$is_reindexed && $is_skipped && $attempt == 0))))) {
      
-    my $index_data_list = get_index_data_list($schema_name, $table_name) || [];
-    
-    if ($DBI::err) {
-      logger(LOG_ERROR, "Table handling interrupt.");
-      return -1;
-    }
+    $is_reindexed = (reindex_table($table_name, $schema_name, $db_name, $print_reindex_queries) || $is_reindexed);
 
-    for my $index_data (@$index_data_list) {
-      my $initial_index_size_stats = get_index_size_statistics($schema_name, $index_data->{indexname});
-      
-      if (!$initial_index_size_stats || ref $initial_index_size_stats ne 'HASH') {
-        logger(LOG_ERROR, "Cannot get index size statistics.");
-        return;
-      }
-      
-      if ($initial_index_size_stats->{page_count} <= 1) {
-        logger(LOG_NOTICE, "Skipping reindex: %s.%s, empty or 1 page index.", $schema_name, $index_data->{indexname});
-        next;
-      }
-      
-      my $index_bloat_stats;
-      if (! $force) {
-        if ($index_data->{indmethod} ne 'btree') {
-          logger(LOG_NOTICE, "Skipping reindex: %s.%s is a %s index not a btree, reindexing is up to you.", $schema_name, $index_data->{indexname}, $index_data->{indmethod}); 
-          logger(LOG_WARNING, "Reindex queries: %s.%s, initial size %d pages (%s)", $schema_name, $index_data->{indexname}, $initial_index_size_stats->{page_count}, nice_size($initial_index_size_stats->{size}));
-          if ($index_data->{data}{allowed}) {
-            logger(LOG_WARNING, "%s; --%s", get_reindex_query($index_data), $db_name);
-            logger(LOG_WARNING, "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
-          } else {  
-            logger(LOG_WARNING, "%s; --%s", get_straight_reindex_query($schema_name, $table_name, $index_data), $db_name);
-          }       
-          next;
-        }
-
-        if ($initial_index_size_stats->{page_count} < MINIMAL_COMPACT_PAGES) {
-          logger(LOG_NOTICE, "Skipping reindex: %s.%s, %d pages from %d pages minimum required.",$schema_name, $index_data->{indexname}, $initial_index_size_stats->{page_count}, MINIMAL_COMPACT_PAGES);
-          next;
-        }
-
-        $index_bloat_stats = get_index_bloat_stats($schema_name, $index_data->{indexname});
-         
-        if ($index_bloat_stats && ref $index_bloat_stats eq 'HASH' && $index_bloat_stats->{'free_percent'} < MINIMAL_COMPACT_PERCENT) {
-          logger(LOG_NOTICE, "Skipping reindex: %s.%s, %d%% space to compact from %d%% minimum required.", $schema_name, $index_data->{indexname}, $index_bloat_stats->{free_percent}, MINIMAL_COMPACT_PERCENT);
-          next;
-        }
-      }
-
-      if (not $index_data->{'allowed'}) {
-        logger(LOG_NOTICE, "Skipping reindex: %s.%s, can not reindex without heavy locks because of its dependencies, reindexing is up to you.", $schema_name, $index_data->{indexname});
-        logger(LOG_WARNING, "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
-           ($force ? ' forced' : ''),
-           $schema_name, 
-           $index_data->{indexname},
-           $initial_index_size_stats->{page_count},
-           nice_size($initial_index_size_stats->{size}),
-           $index_bloat_stats->{free_percent},
-           nice_size($index_bloat_stats->{free_space})
-        );
-        logger(LOG_WARNING, "%s; --%s", get_reindex_query($index_data), $db_name);
-        logger(LOG_WARNING, "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
-
-        next;
-      }
-
-      if (!$no_reindex) {
-        my $start_reindex_time = time;
-        reindex($index_data);
-        
-        if($DBI::err) {
-          logger(LOG_NOTICE, "Skipping index %s: %s", $index_data->{indexname});
-          next;
-        }
-
-        my $reindex_time = time - $start_reindex_time;
-
-        my $locked_alter_attempt = 0;
-        while ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
-          unless(defined(alter_index($schema_name, $table_name, $index_data))) {
-            if ($DBI::errstr && $DBI::errstr =~ 'canceling statement due to statement timeout') {  
-              $locked_alter_attempt++;
-              next;
-            } else {
-              logger(LOG_ERROR, $@);
-              return;
-            }
-          };
-          $reindex_time = time - $start_reindex_time;
-          last;
-        }
-        if ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
-            my $new_stats = get_index_size_statistics($schema_name, $index_data->{indexname});
-            my $free_percent = 100 * (1 - $new_stats->{size} / $initial_index_size_stats->{size});
-            my $free_space = ($initial_index_size_stats->{size} - $new_stats->{size});
-            logger(LOG_WARNING, "Reindex%s: %s.%s, initial size %d pages(%s), has been reduced by %d%% (%s), duration %d seconds, attempts %d.",
-              ($force ? " forced" : ""),
-              $schema_name,
-              $index_data->{indexname},
-              $initial_index_size_stats->{page_count},
-              nice_size($initial_index_size_stats->{size}),
-              int($free_percent),
-              nice_size($free_space),
-              $reindex_time,
-              $locked_alter_attempt
-            );
-                
-          $is_reindexed = (defined $is_reindexed) ? ($is_reindexed and 1) : 1;
-        } else {
-          my $drop_index_time = time;
-          drop_temp_index($schema_name);
-          $reindex_time += time - $drop_index_time;
-          logger(LOG_WARNING, "Reindex%s: %s.%s, lock has not been acquired, initial size %d pages(%d), , can be reduced by %d%% (%s), duration %d seconds.",
-            ($force ? " forced" : ""),
-            $schema_name,
-            $index_data->{indexname},
-            $initial_index_size_stats->{page_count},
-            nice_size($initial_index_size_stats->{size}),
-            $bloat_stats->{free_percent},
-            nice_size($bloat_stats->{free_space}),
-            $reindex_time
-          );  
-          $is_reindexed = 0;
-        }
-      }
-
-      if ($print_reindex_queries) {
-        logger(LOG_WARNING, "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
-           ($force ? ' forced' : ''),
-           $schema_name,
-           $index_data->{indexname},
-           $initial_index_size_stats->{page_count},
-           nice_size($initial_index_size_stats->{size}),
-           $index_bloat_stats->{free_percent},
-           nice_size($index_bloat_stats->{free_space})
-        );
-        logger(LOG_WARNING, "%s; --%s", get_reindex_query($index_data), $db_name);
-        logger(LOG_WARNING, "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
-      }
-    }      
-    
     if (!$no_reindex) {
       $table_info->{stats} = get_size_stats($schema_name, $table_name);
     
@@ -1388,7 +1409,7 @@ sub process {
   }
     
   if (!$is_locked && !($is_skipped && !defined($is_reindexed))) {
-    my $complete = (($is_compacted || $will_be_skipped || $is_skipped) && (defined $is_reindexed ? $is_reindexed : 1));
+    my $complete = (($will_be_skipped || $is_skipped) && (defined $is_reindexed ? $is_reindexed : 1));
     if ($complete) {
       logger(LOG_NOTICE, "Processing complete.");
     } else {
@@ -1415,7 +1436,7 @@ sub process {
     }
   }
 
-  return ($is_locked || ($is_compacted or $is_skipped or $will_be_skipped) and (defined $is_reindexed ? $is_reindexed : 1));
+  return (($is_locked || $is_skipped || $will_be_skipped) && (defined $is_reindexed ? $is_reindexed : 1));
 }
 
 #Main code
@@ -1437,6 +1458,11 @@ if ($show_man) {
 
 unless ($db_name || $table_name || $all_db) {
   not_enough_arguments();
+  exit(1);
+}
+
+if ($no_reindex && $initial_reindex) {
+  no_together_arguments('no_reindex', 'initial_reindex');
   exit(1);
 }
 
