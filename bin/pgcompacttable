@@ -1576,12 +1576,18 @@ foreach my $current_db_name (@dbs) {
     foreach my $current_ident (@$database_tables) {
       next if (!$current_ident || ref $current_ident ne 'HASH' || $excluded_schemas{$current_ident->{schemaname}} || ($only_schema && !$only_schemas{$current_ident->{schemaname}}) || $excluded_tables{"$current_ident->{schemaname}.$current_ident->{tablename}"});
       my $table_key = $current_ident->{schemaname}.$current_ident->{tablename};
-      $table_info{$current_db_name}{tables}{$table_key} = {} unless ($table_info{$current_db_name}{tables}{$table_key} && ref $table_info{$current_db_name}{tables}{$table_key} eq 'HASH');
+      $table_info{$current_db_name}{tables}{$table_key}{current} = {} unless ($table_info{$current_db_name}{tables}{$table_key}{current} && ref $table_info{$current_db_name}{tables}{$table_key}{current} eq 'HASH');
       $is_something_processed = 1 unless ($is_something_processed);
       set_current_schema_name_table_name($current_ident->{schemaname}, $current_ident->{tablename});
       logger(LOG_NOTICE, "Start handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
-      push @retry_idents, $current_ident unless process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt, $table_info{$current_db_name}{tables}{$table_key});
+      push @retry_idents, $current_ident unless process($current_ident->{schemaname}, $current_ident->{tablename}, $attempt, $table_info{$current_db_name}{tables}{$table_key}{current});
       logger(LOG_NOTICE, "Finish handling table %s.%s", $current_ident->{schemaname}, $current_ident->{tablename});
+      if ($attempt == 0) {
+        $table_info{$current_db_name}{tables}{$table_key}{final}{base_stats}{size} = $table_info{$current_db_name}{tables}{$table_key}{current}{base_stats}{size}; 
+        $table_info{$current_db_name}{tables}{$table_key}{final}{base_stats}{total_size} = $table_info{$current_db_name}{tables}{$table_key}{current}{base_stats}{total_size};
+      }
+      $table_info{$current_db_name}{tables}{$table_key}{final}{stats}{size} = $table_info{$current_db_name}{tables}{$table_key}{current}{stats}{size}; 
+      $table_info{$current_db_name}{tables}{$table_key}{final}{stats}{total_size} = $table_info{$current_db_name}{tables}{$table_key}{current}{stats}{total_size};
     }
     
     if (scalar @retry_idents > 0) {
@@ -1602,8 +1608,8 @@ foreach my $current_db_name (@dbs) {
   
   logger(LOG_WARNING, "Processing %scomplete%s.", ($tables_left ? 'in' : ''), ($tables_left ? ": $tables_left tables left" : ''));
   
-  $table_info{$current_db_name}{size} = sum(map {$table_info{$current_db_name}{tables}{$_}{base_stats}{size} - $table_info{$current_db_name}{tables}{$_}{stats}{size}} keys(%{$table_info{$current_db_name}{tables}}));
-  $table_info{$current_db_name}{total_size} = sum(map {$table_info{$current_db_name}{tables}{$_}{base_stats}{total_size} - $table_info{$current_db_name}{tables}{$_}{stats}{total_size}} keys(%{$table_info{$current_db_name}{tables}}));
+  $table_info{$current_db_name}{size} = sum(map {$table_info{$current_db_name}{tables}{$_}{final}{base_stats}{size} - $table_info{$current_db_name}{tables}{$_}{final}{stats}{size}} keys(%{$table_info{$current_db_name}{tables}}));
+  $table_info{$current_db_name}{total_size} = sum(map {$table_info{$current_db_name}{tables}{$_}{final}{base_stats}{total_size} - $table_info{$current_db_name}{tables}{$_}{final}{stats}{total_size}} keys(%{$table_info{$current_db_name}{tables}}));
   logger(LOG_ERROR, "Processing results: size reduced by %s (%s including toasts and indexes) in total.", nice_size($table_info{$current_db_name}{size}), nice_size($table_info{$current_db_name}{total_size}));
 
   db_disconnect($current_db_name);
@@ -1862,7 +1868,7 @@ A maximum number of retries in case of unsuccessful processing. By default 10.
 
 =head1 LICENSE AND COPYRIGHT
 
-Copyright (c) 2014 Maxim Boguk
+Copyright (c) 2015 Maxim Boguk
 
 =head1 AUTHOR
 
