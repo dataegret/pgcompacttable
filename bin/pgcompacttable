@@ -1833,7 +1833,13 @@ Turn on the routine vacuum. By default all the vacuums are off.
 
 =item B<--no-reindex>
 
-Reindex tables after processing.
+Turn off reindexing of tables after processing.
+
+=item B<-i>
+
+=item B<--initial-reindex>
+
+Perform an initial reindex of tables before processing.
 
 =item B<-s>
 
