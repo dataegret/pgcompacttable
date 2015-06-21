@@ -756,7 +756,7 @@ FROM (
         current_setting('block_size')::real AS bs
 ) AS sq
   ");
-
+  
   $sth->execute($schema_name, $index_name);
 
   if ($DBI::err) {
@@ -766,7 +766,7 @@ FROM (
 
   my $result = $sth->fetchrow_hashref;
   
-  return ($result && ref $result eq 'HASH' && $result->{size} && $result->{page_count} ? $result : undef);
+  return ($result && ref $result eq 'HASH' && defined $result->{size} && defined $result->{page_count} ? $result : undef);
 }
 
 sub get_reindex_query {
@@ -854,7 +854,7 @@ FROM (
   $sth->execute($schema_name, $index_name, $schema_name, $index_name);
 
   if ($DBI::err) {
-    logger(LOG_ERROR, "SQL Error: %s", $DBI::err);
+    logger(LOG_ERROR, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -869,7 +869,7 @@ sub reindex {
   _dbh->do(get_reindex_query($index_data));
 
   if ($DBI::err) {
-    logger(LOG_ERROR, "SQL Error: %s", $DBI::err);
+    logger(LOG_ERROR, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
@@ -901,7 +901,7 @@ sub drop_temp_index {
   _dbh->do("DROP INDEX CONCURRENTLY ?;", undef, "$schema_name.pgcompact_index_$$");
 
   if ($DBI::err) {
-    logger(LOG_ERROR, "SQL Error: %s", $DBI::err);
+    logger(LOG_ERROR, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
 
