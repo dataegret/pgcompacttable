@@ -222,6 +222,8 @@ sub db_connect {
     return undef;
   }
 
+  $_dbh->do("set client_min_messages to warning;");
+
   return $_dbh;
 }
 
