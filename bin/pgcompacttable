@@ -36,6 +36,7 @@ use constant LOG_ALWAYS => 1000;
 use constant LOG_ERROR => 2;
 use constant LOG_WARNING => 1;
 use constant LOG_NOTICE => 0;
+use constant DROP_INDEX_CONCURRENTLY_MIN_VERSION => 90200;
 
 # Settings & defaults
 
@@ -70,10 +71,13 @@ my $exclude_table;
 my %only_schemas;
 my %excluded_schemas;
 my %excluded_tables;
+my $exclusive_drop_index;
 
 my $initial_reindex;
 
 my %table_info;
+my $server_version;
+my $drop_index_concurrently = 1;
 
 unless (GetOptions(
             #help & man
@@ -90,6 +94,7 @@ unless (GetOptions(
             't|table=s' => \$table_name,
             'v|verbose' => \$verbose,
             'q|quiet' => \$quiet,
+            'e|exclusive-drop-index' => \$exclusive_drop_index,
             'f|force' => \$force,
             'r|no-reindex' => \$no_reindex,
             's|print-reindex-queries' => \$print_reindex_queries,
@@ -99,7 +104,7 @@ unless (GetOptions(
             'a|all' => \$all_db,
             'N|exclude-schema=s' => \$exclude_schema,
             'T|exclude-table=s' => \$exclude_table,
-            'i|initial-reindex' => \$initial_reindex
+            'i|initial-reindex' => \$initial_reindex,
           )) {
  show_usage();
  exit(0);
@@ -232,6 +237,23 @@ sub db_disconnect {
   logger(LOG_WARNING, "Disconnecting from database");
   _dbh->disconnect;
 }
+
+sub check_server_version {
+  my $sth = _dbh->prepare("SHOW server_version_num");
+  $sth->execute;
+  my $result = $sth->fetchrow_hashref;
+  $server_version = int($result->{'server_version_num'});
+  if($server_version < DROP_INDEX_CONCURRENTLY_MIN_VERSION) {
+    unless($exclusive_drop_index) {
+      logger(LOG_ERROR, "Dropping indexes concurrently is supported since PostgreSQL 9.2.0. Use -e to allow drop indexes using exclusive lock.");
+      exit(1);
+    }
+    else {
+      $drop_index_concurrently = 0;
+    }
+  }
+}
+
 
 sub get_databases {
   my $sth = _dbh->prepare("
@@ -797,12 +819,12 @@ ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identif
 END;";
   } else {
     my $tmp_index_name = "tmp_".int(rand(1000000000));
+    my $drop_index_clause = "DROP INDEX " . ($drop_index_concurrently ? "CONCURRENTLY" : "") . " " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($tmp_index_name) . ";";
     return
     "BEGIN;" . "
 ALTER INDEX " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($index_data->{indexname}) . " RENAME TO " . _dbh->quote_identifier($tmp_index_name) . ";
 ALTER INDEX " . _dbh->quote_identifier($schema_name) . ".pgcompact_index_$$ RENAME TO " . _dbh->quote_identifier($index_data->{indexname}) . ";
-END;
-DROP INDEX CONCURRENTLY " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($tmp_index_name) . ";";
+END;" . $drop_index_clause;
   }
 }
 
@@ -899,8 +921,10 @@ sub alter_index {
 sub drop_temp_index {
   my $schema_name = shift;
 
-  _dbh->do("SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . ";"); 
-  _dbh->do("DROP INDEX CONCURRENTLY ?;", undef, "$schema_name.pgcompact_index_$$");
+  if ($drop_index_concurrently) {
+    _dbh->do("SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . ";"); 
+  }
+  _dbh->do("DROP INDEX " . ($drop_index_concurrently ? "CONCURRENTLY" : "") . " ?;", undef, "$schema_name.pgcompact_index_$$");
 
   if ($DBI::err) {
     logger(LOG_ERROR, "SQL Error: %s", $DBI::errstr);
@@ -1515,6 +1539,8 @@ foreach my $current_db_name (@dbs) {
     next;
   }
 
+  check_server_version;
+
   my $ionice_made = undef;
 
   my $backend_pid = get_pg_backend_pid();
@@ -1849,6 +1875,13 @@ Perform an initial reindex of tables before processing.
 
 Print reindex queries. Useful if you want to perform manual
 reindex later.
+
+=item B<-e>
+
+=item B<--exclusive-drop-index>
+
+Drop indexes using exclusive lock if server does not support DROP INDEX CONCURRENTLY which is
+supported since 9.2.
 
 =item B<-f>
 
