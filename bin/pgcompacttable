@@ -21,6 +21,7 @@ select(STDOUT);
 our $_log = select();
 our $_log_level;
 our $_dbh;
+our $_after_round_statement;
 
 use constant MINIMAL_COMPACT_PAGES => 10;
 use constant MINIMAL_COMPACT_PERCENT => 20;
@@ -57,6 +58,7 @@ my $quiet;
 
 my $force;
 my $delay_ratio = 0;
+my $after_round_query;
 my $routine_vacuum;
 my $no_reindex;
 my $print_reindex_queries = 0;
@@ -95,6 +97,7 @@ unless (GetOptions(
             's|print-reindex-queries' => \$print_reindex_queries,
             'o|max-retry-count=i' => \$max_retry_count,
             'E|delay-ratio=i' => \$delay_ratio,
+            'Q|after-round-query=s' => \$after_round_query,
             'R|routine-vacuum' => \$routine_vacuum,
             'a|all' => \$all_db,
             'N|exclude-schema=s' => \$exclude_schema,
@@ -170,6 +173,10 @@ sub unset_current_schema_name_table_name {
   undef $_current_table_name;
 }
 
+sub unset_after_round_statement {
+  undef $_after_round_statement;
+}
+
 sub logger {
   my $level = shift;
   my $message = shift;
@@ -206,12 +213,28 @@ sub _dbh {
   return $_dbh;
 }
 
+sub _after_round_statement {
+  unless ($_after_round_statement) {
+    if ($after_round_query) {
+      $_after_round_statement = _dbh->prepare($after_round_query);
+
+      if ($DBI::err) {
+        logger(LOG_WARNING, "SQL Error in after round query %s: %s", $after_round_query, $DBI::errstr);
+        unset $_after_round_statement;
+      }
+    }
+  }
+  return $_after_round_statement;
+}
+
 sub db_connect {
   my $db_name = shift;
   my $db_host = shift;
   my $db_port = shift;
   my $db_user = shift;
   my $db_password = shift;
+
+  unset_after_round_statement;
 
   logger(LOG_WARNING, "Connecting to database");
 
@@ -1272,6 +1295,14 @@ sub process {
       } 
 
       sleep($delay_ratio * (time - $start_time));
+      
+      if (_after_round_statement) {
+        _after_round_statement->execute();
+
+        if ($DBI::err) {
+          logger(LOG_ERROR, "SQL Error in after round statement: %s",  $DBI::errstr);
+        }
+      }
 
       if (time - $progress_report_time >= PROGRESS_REPORT_PERIOD && $last_to_page != $to_page) {
         logger(LOG_WARNING, "Progress: %s %d pages completed.", (defined $bloat_stats->{effective_page_count} ? int(100 * ($to_page ? ($initial_size_stats->{page_count} - $to_page - 1) / ($table_info->{base_stats}{page_count} - $bloat_stats->{effective_page_count}) : 1) ).'%, ' : ' '), ($table_info->{stats}{page_count} - $to_page - 1));
@@ -1861,6 +1892,12 @@ Try to compact even those tables and indexes that do not meet minimal bloat requ
 =item B<--delay-ratio> RATIO
 
 A dynamic part of the delay between rounds is calculated as previous-round-time * delay-ratio. By default 2.
+
+=item B<-Q> Query
+
+=item B<--after-round-query> Query
+
+SQL statement to be called after each round against current database
 
 =item B<-o> COUNT
 
