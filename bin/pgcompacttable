@@ -821,7 +821,7 @@ END;";
   } else {
     my $tmp_index_name = "tmp_".int(rand(1000000000));
     return
-    "BEGIN;" . "
+    "BEGIN; SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . ";
 ALTER INDEX " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($index_data->{indexname}) . " RENAME TO " . _dbh->quote_identifier($tmp_index_name) . ";
 ALTER INDEX " . _dbh->quote_identifier($schema_name) . ".pgcompact_index_$$ RENAME TO " . _dbh->quote_identifier($index_data->{indexname}) . ";
 END;
