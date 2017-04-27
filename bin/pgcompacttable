@@ -1560,7 +1560,7 @@ foreach my $current_db_name (@dbs) {
         $ionice_made = 1;
       }
     }
-    logger(LOG_WARNING, "Postgress backend pid: $backend_pid") if ($backend_pid && $backend_pid =~/^\d+$/ && $backend_pid > 0);
+    logger(LOG_WARNING, "Postgres backend pid: $backend_pid") if ($backend_pid && $backend_pid =~/^\d+$/ && $backend_pid > 0);
   } else {
     logger(LOG_ERROR, "Cannot get backend pid from Postgres. Exitting...");
     exit(-1);
