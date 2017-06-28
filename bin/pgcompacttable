@@ -246,6 +246,7 @@ sub db_connect {
   }
 
   $_dbh->do("set client_min_messages to warning;");
+  $_dbh->do("set lc_messages TO 'C';");
 
   return $_dbh;
 }
@@ -911,8 +912,6 @@ sub alter_index {
     _dbh->do("$sql;");
 
     if ($DBI::err) {
-      logger(LOG_ERROR, "SQL Error: %s", $DBI::errstr);
-      _dbh->do("END;");
       return undef;
     }
 
@@ -1025,10 +1024,21 @@ sub reindex_table {
       my $locked_alter_attempt = 0;
       while ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
         unless(defined(alter_index($schema_name, $table_name, $index_data))) {
-          if ($DBI::errstr && $DBI::errstr =~ 'canceling statement due to statement timeout') {
+          my $db_errstr = $DBI::errstr;
+
+          _dbh->do("END;");
+
+          if ($db_errstr && $db_errstr =~ 'canceling statement due to statement timeout') {
             $locked_alter_attempt++;
+            logger(LOG_NOTICE, "Reindex%s: %s.%s, lock retry %d",
+              ($force ? " forced" : ""),
+              $schema_name,
+              $index_data->{indexname},
+              $locked_alter_attempt
+            );
             next;
           } else {
+            logger(LOG_ERROR, "SQL Error: %s", $db_errstr);
             logger(LOG_ERROR, $@);
             return;
           }
