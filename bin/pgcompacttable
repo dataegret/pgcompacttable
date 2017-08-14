@@ -52,6 +52,7 @@ my $db_passwd = '';
 my $db_name = $ENV{LOGNAME} || $ENV{USER} || getpwuid($<);
 my $schema_name = 'public';
 my $table_name;
+my $table_names_like;
 
 my $verbose;
 my $quiet;
@@ -90,6 +91,7 @@ unless (GetOptions(
             'd|dbname=s' => \$db_name,
             'n|schema=s' => \$only_schema,
             't|table=s' => \$table_name,
+            'tables-like=s' => \$table_names_like,
             'v|verbose' => \$verbose,
             'q|quiet' => \$quiet,
             'f|force' => \$force,
@@ -279,12 +281,21 @@ ORDER BY pg_catalog.pg_database_size(datname), datname
 }
 
 sub get_database_tables {
+  my $database_name = shift;
+  my $table_names_like = shift;
+
+  my $extra_conditions = '';
+  if ($table_names_like) {
+    $extra_conditions .= " AND tablename LIKE " . _dbh->quote($table_names_like);
+  }
+
   my $sth = _dbh->prepare("
 SELECT schemaname, tablename FROM pg_catalog.pg_tables
 WHERE
     NOT (schemaname = 'pg_catalog' AND tablename = 'pg_index') AND
     schemaname !~ 'pg_(temp|toast|catalog).*' AND
     NOT schemaname = 'information_schema'
+    $extra_conditions
 ORDER BY
     pg_catalog.pg_relation_size(
         quote_ident(schemaname) || '.' || quote_ident(tablename)),
@@ -1592,7 +1603,7 @@ foreach my $current_db_name (@dbs) {
     next;
   }
 
-  my $database_tables = ($schema_name && $table_name) ? [{schemaname => $schema_name, tablename => $table_name}] : get_database_tables($current_db_name);
+  my $database_tables = ($schema_name && $table_name) ? [{schemaname => $schema_name, tablename => $table_name}] : get_database_tables($current_db_name, $table_names_like);
 
   unless($database_tables && ref $database_tables eq 'ARRAY' && scalar(@$database_tables) > 0) {
     logger('qiuet', "Skip handling database %s: cannot find tables", $current_db_name);
@@ -1843,6 +1854,10 @@ A schema to exclude from processing.
 =item B<--table> TABLE
 
 A table to process. By default all the tables of the specified schema are processed.
+
+=item B<--tables-like> 'LIKE expression'
+
+Condition to find tables to process by passing argument to SQL condition tablename LIKE ?. % for wildcard, _ for any one symbol. By default all the tables of the specified schema are processed.
 
 =item B<-T> TABLE
 
