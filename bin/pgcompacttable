@@ -1021,7 +1021,7 @@ sub reindex_table {
       reindex($index_data);
 
       if($DBI::err) {
-        logger(LOG_NOTICE, "Skipping index %s: %s", $index_data->{indexname}, $DBI::err);
+        logger(LOG_NOTICE, "Skipping index %s: %s", $index_data->{indexname}, $DBI::errstr);
         drop_temp_index($schema_name);
         next;
       }
