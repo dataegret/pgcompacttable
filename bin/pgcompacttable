@@ -737,6 +737,11 @@ SELECT
             (objid = indexoid AND classid = pgclassid) OR
             (refobjid = indexoid AND refclassid = pgclassid)
     )::integer AS allowed,
+    (
+        SELECT string_to_array(indkey::text, ' ')::int2[] @> array[0::int2]
+        FROM pg_catalog.pg_index
+        WHERE indexrelid = indexoid
+    )::integer as is_functional,
     condeferrable as is_deferrable,
     condeferred as is_deferred,
     pg_catalog.pg_relation_size(indexoid) as idxsize
@@ -1028,11 +1033,27 @@ sub reindex_table {
       reindex($index_data);
 
       if($DBI::err) {
-        logger(LOG_NOTICE, "Skipping index %s: %s", $index_data->{indexname});
+        logger(LOG_NOTICE, "Skipping index %s: %s", $index_data->{indexname}, $DBI::errstr);
+        drop_temp_index($schema_name);
         next;
       }
 
       my $reindex_time = time - $start_reindex_time;
+
+      if ($index_data->{is_functional}) {
+        # perform auto analyze for functional indexes
+        my $analyze_time = time;
+        analyze($schema_name, $table_name);
+
+        if ($DBI::err) {
+          logger(LOG_ERROR, "Autoanalyze functional index error");
+          drop_temp_index($schema_name);
+          next;
+        }
+
+        $analyze_time = time - $analyze_time;
+        logger(LOG_NOTICE, "Autoanalyze functional index: duration %.3f second.", $analyze_time);
+      }
 
       my $locked_alter_attempt = 0;
       while ($locked_alter_attempt < $reindex_retry_max_count) {
