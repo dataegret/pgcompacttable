@@ -13,7 +13,7 @@ use DBI;
 
 use Data::Dumper;
 
-our $VERSION = '1.0.2';
+our $VERSION = '1.0.3';
 
 local $| = 1;
 select(STDOUT);
@@ -31,8 +31,6 @@ use constant PAGES_BEFORE_VACUUM_LOWER_DIVISOR => 16;
 use constant PAGES_BEFORE_VACUUM_LOWER_THRESHOLD => 1000;
 use constant PAGES_BEFORE_VACUUM_UPPER_DIVISOR => 50;
 use constant PROGRESS_REPORT_PERIOD => 60;
-use constant LOCKED_ALTER_TIMEOUT => 1000;
-use constant LOCKED_ALTER_COUNT => 100;
 use constant LOG_ALWAYS => 1000;
 use constant LOG_ERROR => 2;
 use constant LOG_WARNING => 1;
@@ -63,6 +61,9 @@ my $routine_vacuum;
 my $no_reindex;
 my $print_reindex_queries = 0;
 my $max_retry_count = 10;
+my $reindex_retry_max_count = 100;
+my $reindex_retry_pause = 1;
+my $reindex_lock_timeout = 1000;
 
 my $all_db;
 
@@ -94,6 +95,9 @@ unless (GetOptions(
             'q|quiet' => \$quiet,
             'f|force' => \$force,
             'r|no-reindex' => \$no_reindex,
+            'reindex-retry-count=i' => \$reindex_retry_max_count,
+            'reindex-retry-pause=i' => \$reindex_retry_pause,
+            'reindex-lock-timeout=i' => \$reindex_lock_timeout,
             's|print-reindex-queries' => \$print_reindex_queries,
             'o|max-retry-count=i' => \$max_retry_count,
             'E|delay-ratio=i' => \$delay_ratio,
@@ -246,6 +250,7 @@ sub db_connect {
   }
 
   $_dbh->do("set client_min_messages to warning;");
+  $_dbh->do("set lc_messages TO 'C';");
 
   return $_dbh;
 }
@@ -813,15 +818,15 @@ sub get_alter_index_query {
   my $constraint_ident = _dbh->quote_identifier($index_data->{conname}) if ($index_data && ref $index_data eq 'HASH' && $index_data->{conname});
 
   if($constraint_ident) {
-    return 
-    "BEGIN; SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . ";
+    return
+    "BEGIN; SET LOCAL statement_timeout TO " . $reindex_lock_timeout . ";
 ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name) . " DROP CONSTRAINT $constraint_ident;
 ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name) . " ADD CONSTRAINT $constraint_ident $index_data->{contypedef} USING INDEX pgcompact_index_$$;
 END;";
   } else {
     my $tmp_index_name = "tmp_".int(rand(1000000000));
     return
-    "BEGIN; SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . ";
+    "BEGIN; SET LOCAL statement_timeout TO " . $reindex_lock_timeout . ";
 ALTER INDEX " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($index_data->{indexname}) . " RENAME TO " . _dbh->quote_identifier($tmp_index_name) . ";
 ALTER INDEX " . _dbh->quote_identifier($schema_name) . ".pgcompact_index_$$ RENAME TO " . _dbh->quote_identifier($index_data->{indexname}) . ";
 END;
@@ -911,8 +916,6 @@ sub alter_index {
     _dbh->do("$sql;");
 
     if ($DBI::err) {
-      logger(LOG_ERROR, "SQL Error: %s", $DBI::errstr);
-      _dbh->do("END;");
       return undef;
     }
 
@@ -922,10 +925,10 @@ sub alter_index {
 sub drop_temp_index {
   my $schema_name = shift;
 
-  _dbh->do("SET LOCAL statement_timeout TO " . LOCKED_ALTER_TIMEOUT . ";"); 
-  _dbh->do("DROP INDEX CONCURRENTLY ?;", undef, "$schema_name.pgcompact_index_$$");
+  _dbh->do("DROP INDEX CONCURRENTLY " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier("pgcompact_index_$$") . ";");
 
   if ($DBI::err) {
+    logger(LOG_ERROR, "Unable remove temporary index pgcompact_index_$$");
     logger(LOG_ERROR, "SQL Error: %s", $DBI::errstr);
     return undef;
   }
@@ -1023,12 +1026,26 @@ sub reindex_table {
       my $reindex_time = time - $start_reindex_time;
 
       my $locked_alter_attempt = 0;
-      while ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
+      while ($locked_alter_attempt < $reindex_retry_max_count) {
         unless(defined(alter_index($schema_name, $table_name, $index_data))) {
-          if ($DBI::errstr && $DBI::errstr =~ 'canceling statement due to statement timeout') {
+          my $db_errstr = $DBI::errstr;
+
+          _dbh->do("END;");
+
+          if ($db_errstr && $db_errstr =~ 'canceling statement due to statement timeout') {
             $locked_alter_attempt++;
+            logger(LOG_NOTICE, "Reindex%s: %s.%s, lock retry %d",
+              ($force ? " forced" : ""),
+              $schema_name,
+              $index_data->{indexname},
+              $locked_alter_attempt
+            );
+            if ($reindex_retry_pause) {
+                sleep($reindex_retry_pause);
+            }
             next;
           } else {
+            logger(LOG_ERROR, "SQL Error: %s", $db_errstr);
             logger(LOG_ERROR, $@);
             return;
           }
@@ -1036,7 +1053,7 @@ sub reindex_table {
         $reindex_time = time - $start_reindex_time;
         last;
       }
-      if ($locked_alter_attempt < LOCKED_ALTER_COUNT) {
+      if ($locked_alter_attempt < $reindex_retry_max_count) {
           my $new_stats = get_index_size_statistics($schema_name, $index_data->{indexname});
           my $free_percent = 100 * (1 - $new_stats->{size} / $initial_index_size_stats->{size});
           my $free_space = ($initial_index_size_stats->{size} - $new_stats->{size});
@@ -1053,10 +1070,15 @@ sub reindex_table {
           );
         $is_reindexed = (defined $is_reindexed) ? ($is_reindexed and 1) : 1;
       } else {
+        logger(LOG_NOTICE, "Reindex%s: %s.%s, unable lock, delete index",
+          ($force ? " forced" : ""),
+          $schema_name,
+          $index_data->{indexname}
+        );
         my $drop_index_time = time;
         drop_temp_index($schema_name);
         $reindex_time += time - $drop_index_time;
-        logger(LOG_WARNING, "Reindex%s: %s.%s, lock has not been acquired, initial size %d pages(%d)",#, can be reduced by %d%% (%s), duration %d seconds.",
+        logger(LOG_WARNING, "Reindex%s: %s.%s, lock has not been acquired, initial size %d pages(%s)",#, can be reduced by %d%% (%s), duration %d seconds.",
           ($force ? " forced" : ""),
           $schema_name,
           $index_data->{indexname},
@@ -1555,7 +1577,7 @@ foreach my $current_db_name (@dbs) {
       my $errstr = `ionice -c 3 -p $backend_pid 2>/dev/stdout`;
       if ($errstr) {
         chomp $errstr;
-        logger(LOG_WARNING, "Cannot set ionice 3 for the process. It is recomennded to set ionice -c 3 for pgcompacttable. Error: %s", $errstr);
+        logger(LOG_WARNING, "Cannot set ionice 3 for the process. It is recommended to set ionice -c 3 for pgcompacttable. Error: %s", $errstr);
       } else {
         $ionice_made = 1;
       }
@@ -1567,7 +1589,7 @@ foreach my $current_db_name (@dbs) {
   }
 
   unless ($ionice_made) {
-    logger(LOG_WARNING, "It is recomennded to set ionice -c 3 for pgcompacttable: ionice -c 3 -p %d", $backend_pid);
+    logger(LOG_WARNING, "It is recommended to set ionice -c 3 for pgcompacttable: ionice -c 3 -p %d", $backend_pid);
   }
 
   set_session_replication_role;
@@ -1881,6 +1903,18 @@ Perform an initial reindex of tables before processing.
 Print reindex queries. Useful if you want to perform manual
 reindex later.
 
+=item B<--reindex-retry-count>
+
+Attempts count to concurrently safe replace bloated index to new. Default 100
+
+=item B<--reindex-retry-pause>
+
+Pause between reindex attempts in seconds. Default is 1 second
+
+=item B<--reindex-lock-timeout>
+
+Statement timeout for reindex ALTER TABLE queries. Default is 1000 (ms)
+
 =item B<-f>
 
 =item B<--force>
@@ -1904,8 +1938,6 @@ SQL statement to be called after each round against current database
 =item B<--max-retry-count> COUNT
 
 A maximum number of retries in case of unsuccessful processing. By default 10.
-
-=item B<-x> COUNT
 
 =back
 
