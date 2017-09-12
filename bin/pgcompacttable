@@ -737,7 +737,9 @@ SELECT
             (objid = indexoid AND classid = pgclassid) OR
             (refobjid = indexoid AND refclassid = pgclassid)
     )::integer AS allowed,
-    pg_catalog.pg_relation_size(indexoid)
+    condeferrable as is_deferrable,
+    condeferred as is_deferred,
+    pg_catalog.pg_relation_size(indexoid) as idxsize
 FROM (
     SELECT
         indexname, tablespace, indexdef,
@@ -756,7 +758,7 @@ FROM (
 ) AS sq
 LEFT JOIN pg_catalog.pg_constraint ON
     conindid = indexoid AND contype IN ('p', 'u')
-ORDER BY 8
+ORDER BY idxsize
  ");
   
   $sth->execute($schema_name, $table_name);
@@ -818,10 +820,17 @@ sub get_alter_index_query {
   my $constraint_ident = _dbh->quote_identifier($index_data->{conname}) if ($index_data && ref $index_data eq 'HASH' && $index_data->{conname});
 
   if($constraint_ident) {
-    return
+    my $constraint_options = "$index_data->{contypedef} USING INDEX pgcompact_index_$$";
+    if ($index_data->{is_deferrable}) {
+        $constraint_options .= " DEFERRABLE";
+    }
+    if ($index_data->{is_deferred}) {
+        $constraint_options .= " INITIALLY DEFERRED";
+    }
+    return 
     "BEGIN; SET LOCAL statement_timeout TO " . $reindex_lock_timeout . ";
 ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name) . " DROP CONSTRAINT $constraint_ident;
-ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name) . " ADD CONSTRAINT $constraint_ident $index_data->{contypedef} USING INDEX pgcompact_index_$$;
+ALTER TABLE " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($table_name) . " ADD CONSTRAINT $constraint_ident $constraint_options;
 END;";
   } else {
     my $tmp_index_name = "tmp_".int(rand(1000000000));
