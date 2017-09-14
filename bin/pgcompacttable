@@ -1252,7 +1252,7 @@ sub process {
   if (!$is_locked && !$is_skipped) {
     my $can_be_compacted = ($bloat_stats->{'free_percent'} > 0 && ($table_info->{stats}{page_count} > $bloat_stats->{effective_page_count}));
     if ($can_be_compacted) {
-      logger(LOG_WARNING, "Statistics: %d pages (%d pages including toasts and indexes) , approximately %0.3f%% (%d pages) can be compacted reducing the size by %s.",
+      logger(LOG_WARNING, "Statistics: %d pages (%d pages including toasts and indexes), it is expected that ~%0.3f%% (%d pages) can be compacted with the estimated space saving being %s.",
         $table_info->{stats}{page_count},
         $table_info->{stats}{total_page_count},
         $bloat_stats->{'free_percent'},
@@ -1513,7 +1513,7 @@ sub process {
     }
 
     if (defined $bloat_stats->{free_percent} && defined $bloat_stats->{effective_page_count} && $bloat_stats->{free_percent} > 0 && $table_info->{stats}{page_count} > $bloat_stats->{effective_page_count} && !$complete) {
-      logger(LOG_WARNING, "Processing results: %d pages left (%d pages including toasts and indexes), size reduced by %s (%s including toasts and indexes) in total , approximately %d%% (%d pages) that is %s more were expected to be compacted after this attempt.",
+      logger(LOG_WARNING, "Processing results: %d pages (%d pages including toasts and indexes), size has been reduced by %s (%s including toasts and indexes) in total. This attempt has been initially expected to compact ~%d%% more space (%d pages, %s)",
         $table_info->{stats}{page_count},
         $table_info->{stats}{total_page_count},
         nice_size($table_info->{base_stats}{size} - $table_info->{stats}{size}),
