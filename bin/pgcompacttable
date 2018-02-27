@@ -13,7 +13,7 @@ use DBI;
 
 use Data::Dumper;
 
-our $VERSION = '1.0.3';
+our $VERSION = '1.0.4';
 
 local $| = 1;
 select(STDOUT);
@@ -749,7 +749,7 @@ SELECT
             (refobjid = indexoid AND refclassid = pgclassid)
     )::integer AS allowed,
     (
-        SELECT string_to_array(indkey::text, ' ')::int2[] @> array[0::int2]
+        SELECT string_to_array(indkey::text, ' ')::int2[] operator(pg_catalog.@>) array[0::int2]
         FROM pg_catalog.pg_index
         WHERE indexrelid = indexoid
     )::integer as is_functional,
