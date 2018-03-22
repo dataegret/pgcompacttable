@@ -1819,12 +1819,6 @@ Quiet mode. Do not display any messages exept error messages and total result.
 
 Verbose mode. Display all the progress messages.
 
-=item B<-q>
-
-=item B<--quiet>
-
-A verbosity level. One of C<warning>, C<notice>, C<info>. By default C<notice>.
-
 =back
 
 =head2 Connection options
