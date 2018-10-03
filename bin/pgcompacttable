@@ -13,7 +13,7 @@ use DBI;
 
 use Data::Dumper;
 
-our $VERSION = '1.0.4';
+our $VERSION = '1.0.5';
 
 local $| = 1;
 select(STDOUT);
@@ -758,7 +758,11 @@ SELECT
     pg_catalog.pg_relation_size(indexoid) as idxsize
 FROM (
     SELECT
-        indexname, tablespace, indexdef,
+        indexname, COALESCE(tablespace, (SELECT spcname AS tablespace FROM pg_catalog.pg_tablespace WHERE oid = (SELECT dattablespace
+            FROM pg_catalog.pg_database
+            WHERE 
+                datname = current_database() AND
+                spcname != current_setting('default_tablespace')))) AS tablespace, indexdef,
         (
             quote_ident(schemaname) || '.' ||
             quote_ident(indexname))::regclass AS indexoid,
