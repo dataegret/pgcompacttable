@@ -13,7 +13,7 @@ use DBI;
 
 use Data::Dumper;
 
-our $VERSION = '1.0.5';
+our $VERSION = '1.0.6';
 
 local $| = 1;
 select(STDOUT);
@@ -76,6 +76,7 @@ my %excluded_schemas;
 my %excluded_tables;
 
 my $initial_reindex;
+my $no_initial_vacuum;
 
 my %table_info;
 
@@ -97,6 +98,7 @@ unless (GetOptions(
             'q|quiet' => \$quiet,
             'f|force' => \$force,
             'r|no-reindex' => \$no_reindex,
+            'no-initial-vacuum' => \$no_initial_vacuum,
             'reindex-retry-count=i' => \$reindex_retry_max_count,
             'reindex-retry-pause=i' => \$reindex_retry_pause,
             'reindex-lock-timeout=i' => \$reindex_lock_timeout,
@@ -1181,7 +1183,7 @@ sub process {
 
   $table_info->{base_stats} = {%{$table_info->{stats}}} unless ($table_info->{base_stats});
 
-  if (!$is_locked) {
+  if (!$is_locked && !$no_initial_vacuum) {
     my $vacuum_time = time;
     vacuum($schema_name, $table_name);
 
@@ -1932,6 +1934,10 @@ Turn on the routine vacuum. By default all the vacuums are off.
 =item B<--no-reindex>
 
 Turn off reindexing of tables after processing.
+
+=item B<--no-initial-vacuum>
+
+Turn off initial vacuum before table processing.
 
 =item B<-i>
 
