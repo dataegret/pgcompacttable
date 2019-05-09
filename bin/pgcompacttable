@@ -1760,7 +1760,7 @@ pgcompacttable [OPTION...]
 
 =item Targeting options:
 
-(-a | -d DBNAME...) [-n SCHEMA...] [-t TABLE...] [-D DBNAME...]
+(-a | -d DBNAME...) [-n SCHEMA...] [-t TABLE...]
 [-N SCHEMA...] [-T TABLE...]
 
 =back
@@ -1882,12 +1882,6 @@ Process all the databases in the cluster.
 =item B<--dbname> DBNAME
 
 A database to process. By default all the user databses of the instance are processed.
-
-=item B<-D> DBNAME
-
-=item B<--exclude-dbname> DBNAME
-
-A database to exclude from processing.
 
 =item B<-n> SCHEMA
 
