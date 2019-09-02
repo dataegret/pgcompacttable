@@ -1683,7 +1683,14 @@ foreach my $current_db_name (@dbs) {
     next;
   }
 
-  my $database_tables = ($schema_name && $table_name && is_table($schema_name, $table_name)) ? [{schemaname => $schema_name, tablename => $table_name}] : get_database_tables($current_db_name, $table_names_like);
+  my $database_tables = [];
+  if ($schema_name && $table_name) {
+    if (is_table($schema_name, $table_name)) {
+      $database_tables = [{schemaname => $schema_name, tablename => $table_name}];
+    }
+  } else {
+    $database_tables = get_database_tables($current_db_name, $table_names_like);
+  }
 
   unless($database_tables && ref $database_tables eq 'ARRAY' && scalar(@$database_tables) > 0) {
     logger('qiuet', "Skip handling database %s: cannot find tables", $current_db_name);
