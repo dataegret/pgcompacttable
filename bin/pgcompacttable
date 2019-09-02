@@ -287,6 +287,28 @@ ORDER BY pg_catalog.pg_database_size(datname), datname
   return \@result || [];
 }
 
+sub is_table {
+    my $schema_name = shift;
+    my $table_name = shift;
+
+    my $sth = _dbh->prepare("
+SELECT exists(
+    SELECT 1 FROM pg_catalog.pg_tables
+    WHERE schemaname = ? and tablename = ?
+)
+");
+
+    $sth->execute($schema_name, $table_name);
+
+    if ($DBI::err) {
+      logger(LOG_ERROR, "SQL Error: %s", $DBI::errstr);
+      return undef;
+    }
+
+    my ($result) = $sth->fetchrow_array;
+    return $result;
+}
+
 sub get_database_tables {
   my $database_name = shift;
   my $table_names_like = shift;
@@ -1661,7 +1683,7 @@ foreach my $current_db_name (@dbs) {
     next;
   }
 
-  my $database_tables = ($schema_name && $table_name) ? [{schemaname => $schema_name, tablename => $table_name}] : get_database_tables($current_db_name, $table_names_like);
+  my $database_tables = ($schema_name && $table_name && is_table($schema_name, $table_name)) ? [{schemaname => $schema_name, tablename => $table_name}] : get_database_tables($current_db_name, $table_names_like);
 
   unless($database_tables && ref $database_tables eq 'ARRAY' && scalar(@$database_tables) > 0) {
     logger('qiuet', "Skip handling database %s: cannot find tables", $current_db_name);
