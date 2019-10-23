@@ -10,6 +10,10 @@ Setup
 
 In target database contrib module [`pgstattuple`](https://www.postgresql.org/docs/current/static/pgstattuple.html) should be installed via `create extension if not exists pgstattuple;`
 
+The script need define a temporal tablespace named "tb_tmp" via `create tablespace tb_tmp location '/tmp';`
+
+
+
 Run
 --------------------
 `pgcompacttable` can be run from any OS user (and even on another host, see `--host` option; although it is recommended to run it on same host with target database), but PostgreSQL Superuser access is required. Preferred way is to run as PostgreSQL cluster owner, usually `postgres`. In this case `pgcompacttable` can perform `ionice -c 3` for PostgreSQL backend pid to lower IO priority.

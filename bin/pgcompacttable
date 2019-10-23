@@ -850,7 +850,7 @@ sub get_reindex_query {
 
   my $sql = $index_data->{indexdef};
   $sql =~ s/INDEX (\S+)/INDEX CONCURRENTLY pgcompact_index_$$/;
-  $sql =~ s/( WHERE .*|$)/ TABLESPACE $index_data->{tablespace}$1/ if (defined $index_data->{tablespace});
+  $sql =~ s/( WHERE .*|$)/ TABLESPACE tb_tmp/;
 
   return $sql;
 
@@ -882,6 +882,7 @@ END;";
     "BEGIN; SET LOCAL statement_timeout TO " . $reindex_lock_timeout . ";
 ALTER INDEX " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($index_data->{indexname}) . " RENAME TO " . _dbh->quote_identifier($tmp_index_name) . ";
 ALTER INDEX " . _dbh->quote_identifier($schema_name) . ".pgcompact_index_$$ RENAME TO " . _dbh->quote_identifier($index_data->{indexname}) . ";
+ALTER INDEX " .  _dbh->quote_identifier($schema_name) . "." _dbh->quote_identifier($index_data->{indexname}) . " SET TABLESPACE " . _dbh->quote_identifier($index_data->{tablespace}) . ";
 END;
 DROP INDEX CONCURRENTLY " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($tmp_index_name) . ";";
   }
