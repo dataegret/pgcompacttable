@@ -13,7 +13,7 @@ use DBI;
 
 use Data::Dumper;
 
-our $VERSION = '1.0.6';
+our $VERSION = '1.0.7';
 
 local $| = 1;
 select(STDOUT);
@@ -42,8 +42,10 @@ my $show_version;
 my $show_help;
 my $show_man;
 
-my $db_host = 'localhost';
-my $db_port = 5432;
+# use libpq defaults
+my $db_host = NULL;
+my $db_port = NULL;
+
 my $db_user = $ENV{LOGNAME} || $ENV{USER} || getpwuid($<);
 my $db_passwd = '';
 
@@ -241,15 +243,26 @@ sub db_connect {
   my $db_port = shift;
   my $db_user = shift;
   my $db_password = shift;
+  my $connstr = "DBI:Pg:";
 
   unset_after_round_statement;
 
   logger(LOG_WARNING, "Connecting to database");
 
-  $_dbh = DBI->connect("DBI:Pg:dbname=$db_name;host=$db_host;port=$db_port", $db_user, $db_password,{RaiseError => 0, PrintError => 0, AutoCommit => 1});
-  
+  if ($db_name) {
+    $connstr .= "dbname=$db_name;";
+  }
+  if ($db_host) {
+    $connstr .= "host=$db_host;";
+  }
+  if ($db_port) {
+    $connstr .= "port=$db_port;";
+  }
+
+  $_dbh = DBI->connect($connstr, $db_user, $db_password,{RaiseError => 0, PrintError => 0, AutoCommit => 1});
+
   if($DBI::err) { 
-    logger(LOG_ERROR, "Cannot connect DBI:Pg:dbname=%s;host=%s;port=%s user=%s,passwd=...: %s", $db_name, $db_host, $db_port, $db_user, $DBI::errstr); 
+    logger(LOG_ERROR, "Cannot connect %s user=%s,passwd=...: %s", $connstr, $db_user, $DBI::errstr);
     return undef;
   }
 
@@ -1872,13 +1885,13 @@ file does not exist it tries to get it from C<HOME/.pgpass> file.
 
 =item B<--host> HOST
 
-A database host. By default C<localhost>.
+database server host or socket directory
 
 =item B<-p> PORT
 
 =item B<--port> PORT
 
-A database port. By default C<5432>.
+database server port
 
 =item B<-U> USER
 
