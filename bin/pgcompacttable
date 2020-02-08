@@ -13,7 +13,7 @@ use DBI;
 
 use Data::Dumper;
 
-our $VERSION = '1.0.7';
+our $VERSION = '1.0.8';
 
 local $| = 1;
 select(STDOUT);
@@ -58,7 +58,7 @@ my $verbose;
 my $quiet;
 
 my $force;
-my $delay_ratio = 0;
+my $delay_ratio = 2;
 my $after_round_query;
 my $routine_vacuum;
 my $no_reindex;
