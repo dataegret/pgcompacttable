@@ -13,7 +13,7 @@ use DBI;
 
 use Data::Dumper;
 
-our $VERSION = '1.0.8';
+our $VERSION = '1.0.9';
 
 local $| = 1;
 select(STDOUT);
@@ -1398,7 +1398,11 @@ sub process {
         _dbh->commit();
       } 
 
-      sleep($delay_ratio * (time - $start_time));
+      my $sleep_time = $delay_ratio * (time - $start_time);
+      # This is amazing, but sleep_time may unexpectedly be less than 0. Spotted on windows
+      if ($sleep_time > 0) {
+          sleep($sleep_time);
+      }
       
       if (_after_round_statement) {
         _after_round_statement->execute();
@@ -1601,6 +1605,11 @@ unless ($db_name || $table_name || $all_db) {
 if ($no_reindex && $initial_reindex) {
   no_together_arguments('no_reindex', 'initial_reindex');
   exit(1);
+}
+
+if ($delay_ratio < 0) {
+  logger(LOG_ERROR, "Incorrect delay-ratio: negative time not invented yet.");
+  #exit(1);
 }
 
 my @dbs = ($db_name);
