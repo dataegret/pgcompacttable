@@ -1609,7 +1609,7 @@ if ($no_reindex && $initial_reindex) {
 
 if ($delay_ratio < 0) {
   logger(LOG_ERROR, "Incorrect delay-ratio: negative time not invented yet.");
-  #exit(1);
+  exit(1);
 }
 
 my @dbs = ($db_name);
