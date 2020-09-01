@@ -268,7 +268,7 @@ sub db_connect {
 
   $_dbh->do("set client_min_messages to warning;");
   $_dbh->do("set lc_messages TO 'C';");
-
+   $_dbh->do("set application_name TO pgcompacttable;");
   return $_dbh;
 }
 
