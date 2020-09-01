@@ -13,7 +13,7 @@ use DBI;
 
 use Data::Dumper;
 
-our $VERSION = '1.0.9';
+our $VERSION = '1.0.10';
 
 local $| = 1;
 select(STDOUT);
