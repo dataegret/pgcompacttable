@@ -22,6 +22,7 @@ our $_log = select();
 our $_log_level;
 our $_dbh;
 our $_after_round_statement;
+my $_dbh_server_version;
 
 use constant MINIMAL_COMPACT_PAGES => 10;
 use constant MINIMAL_COMPACT_PERCENT => 20;
@@ -269,6 +270,7 @@ sub db_connect {
   $_dbh->do("set client_min_messages to warning;");
   $_dbh->do("set lc_messages TO 'C';");
    $_dbh->do("set application_name TO pgcompacttable;");
+  ($_dbh_server_version) = _dbh->selectrow_array("SHOW server_version_num");
   return $_dbh;
 }
 
@@ -776,15 +778,16 @@ SELECT
                 deptype IN ('n', 'a', 'i') AND
                 NOT (refobjid = indexoid AND deptype = 'n') AND
                 NOT (
-                    objid = indexoid AND deptype = 'i' AND
-                    (version < array[9,1] OR contype NOT IN ('p', 'u'))))
+                    objid = indexoid AND deptype = 'i'"
+                    . ($_dbh_server_version < 90100 ? " AND contype NOT IN ('p', 'u')":"") . "
+                ))
         FROM pg_catalog.pg_depend
         LEFT JOIN pg_catalog.pg_constraint ON
             pg_catalog.pg_constraint.oid = refobjid
         WHERE
             (objid = indexoid AND classid = pgclassid) OR
             (refobjid = indexoid AND refclassid = pgclassid)
-    )::integer AS allowed,
+    )::integer AS replace_index_possible,
     (
         SELECT string_to_array(indkey::text, ' ')::int2[] operator(pg_catalog.@>) array[0::int2]
         FROM pg_catalog.pg_index
@@ -803,11 +806,7 @@ FROM (
         (
             quote_ident(schemaname) || '.' ||
             quote_ident(indexname))::regclass AS indexoid,
-        'pg_catalog.pg_class'::regclass AS pgclassid,
-        string_to_array(
-            regexp_replace(
-                version(), E'.*PostgreSQL (\\\\d+\\\\.\\\\d+).*', E'\\\\1'),
-            '.')::integer[] AS version
+        'pg_catalog.pg_class'::regclass AS pgclassid
     FROM pg_catalog.pg_indexes
     WHERE
         schemaname = quote_ident(?) AND
@@ -1041,7 +1040,7 @@ sub reindex_table {
       if ($index_data->{indmethod} ne 'btree') {
         logger(LOG_NOTICE, "Skipping reindex: %s.%s is a %s index not a btree, reindexing is up to you.", $schema_name, $index_data->{indexname}, $index_data->{indmethod});
         logger(LOG_WARNING, "Reindex queries: %s.%s, initial size %d pages (%s)", $schema_name, $index_data->{indexname}, $initial_index_size_stats->{page_count}, nice_size($initial_index_size_stats->{size}));
-        if ($index_data->{data}{allowed}) {
+        if ($index_data->{data}{'replace_index_possible'}) {
           logger(LOG_WARNING, "%s; --%s", get_reindex_query($index_data), $db_name);
           logger(LOG_WARNING, "%s; --%s", get_alter_index_query($schema_name, $table_name, $index_data), $db_name);
         } else {
@@ -1063,7 +1062,7 @@ sub reindex_table {
       }
     }
 
-    if (not $index_data->{'allowed'}) {
+    if (not $index_data->{'replace_index_possible'}) {
       logger(LOG_NOTICE, "Skipping reindex: %s.%s, can not reindex without heavy locks because of its dependencies, reindexing is up to you.", $schema_name, $index_data->{indexname});
       logger(LOG_WARNING, "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
          ($force ? ' forced' : ''),
