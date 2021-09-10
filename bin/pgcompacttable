@@ -65,6 +65,7 @@ my $routine_vacuum;
 my $no_reindex;
 my $print_reindex_queries = 0;
 my $max_retry_count = 10;
+my $reindex_replace = 0;
 my $reindex_retry_max_count = 100;
 my $reindex_retry_pause = 1;
 my $reindex_lock_timeout = 1000;
@@ -102,6 +103,7 @@ unless (GetOptions(
             'f|force' => \$force,
             'r|no-reindex' => \$no_reindex,
             'no-initial-vacuum' => \$no_initial_vacuum,
+            'reindex-replace' => \$reindex_replace,
             'reindex-retry-count=i' => \$reindex_retry_max_count,
             'reindex-retry-pause=i' => \$reindex_retry_pause,
             'reindex-lock-timeout=i' => \$reindex_lock_timeout,
@@ -1007,6 +1009,143 @@ sub get_pg_backend_pid {
   return $backend_pid;
 }
 
+sub reindex_index_concurrently {
+    my $index_data = shift;
+    my $schema_name = shift;
+    my $table_name = shift;
+    my $initial_index_size_stats = shift;
+
+    my $start_reindex_time = time;
+
+    _dbh->do("REINDEX INDEX CONCURRENTLY " . _dbh->quote_identifier($schema_name) . "." . _dbh->quote_identifier($index_data->{indexname}));
+
+    my $reindex_time = time - $start_reindex_time;
+
+    if ($DBI::err) {
+      logger(LOG_ERROR, "SQL Error: %s", $DBI::errstr);
+      return 0;
+    }
+
+    my $new_stats = get_index_size_statistics($schema_name, $index_data->{indexname});
+    my $free_percent = 100 * (1 - $new_stats->{size} / $initial_index_size_stats->{size});
+    my $free_space = ($initial_index_size_stats->{size} - $new_stats->{size});
+    logger(LOG_WARNING, "Reindex%s: %s.%s, initial size %d pages(%s), has been reduced by %d%% (%s), duration %d seconds.",
+        ($force ? " forced" : ""),
+        $schema_name,
+        $index_data->{indexname},
+        $initial_index_size_stats->{page_count},
+        nice_size($initial_index_size_stats->{size}),
+        int($free_percent),
+        nice_size($free_space),
+        $reindex_time
+    );
+
+    return 1;
+}
+
+sub reindex_index_old_replace {
+    my $index_data = shift;
+    my $schema_name = shift;
+    my $table_name = shift;
+    my $initial_index_size_stats = shift;
+
+    my $start_reindex_time = time;
+
+    reindex($index_data);
+
+    if($DBI::err) {
+      logger(LOG_NOTICE, "Skipping index %s: %s", $index_data->{indexname}, $DBI::errstr);
+      drop_temp_index($schema_name);
+      next;
+    }
+
+    my $reindex_time = time - $start_reindex_time;
+
+    if ($index_data->{is_functional}) {
+      # perform auto analyze for functional indexes
+      my $analyze_time = time;
+      analyze($schema_name, $table_name);
+
+      if ($DBI::err) {
+        logger(LOG_ERROR, "Autoanalyze functional index error");
+        drop_temp_index($schema_name);
+        next;
+      }
+
+      $analyze_time = time - $analyze_time;
+      logger(LOG_NOTICE, "Autoanalyze functional index: duration %.3f second.", $analyze_time);
+    }
+
+    my $locked_alter_attempt = 0;
+    while ($locked_alter_attempt < $reindex_retry_max_count) {
+      unless(defined(alter_index($schema_name, $table_name, $index_data))) {
+        my $db_errstr = $DBI::errstr;
+
+        _dbh->do("END;");
+
+        if ($db_errstr && $db_errstr =~ 'canceling statement due to statement timeout') {
+          $locked_alter_attempt++;
+          logger(LOG_NOTICE, "Reindex%s: %s.%s, lock retry %d",
+              ($force ? " forced" : ""),
+              $schema_name,
+              $index_data->{indexname},
+              $locked_alter_attempt
+          );
+          if ($reindex_retry_pause) {
+              sleep($reindex_retry_pause);
+          }
+          next;
+        } else {
+          logger(LOG_ERROR, "SQL Error: %s", $db_errstr);
+          logger(LOG_ERROR, $@);
+          return;
+        }
+      };
+      $reindex_time = time - $start_reindex_time;
+      last;
+    }
+
+    if ($locked_alter_attempt < $reindex_retry_max_count) {
+          my $new_stats = get_index_size_statistics($schema_name, $index_data->{indexname});
+          my $free_percent = 100 * (1 - $new_stats->{size} / $initial_index_size_stats->{size});
+          my $free_space = ($initial_index_size_stats->{size} - $new_stats->{size});
+          logger(LOG_WARNING, "Reindex%s: %s.%s, initial size %d pages(%s), has been reduced by %d%% (%s), duration %d seconds, attempts %d.",
+            ($force ? " forced" : ""),
+            $schema_name,
+            $index_data->{indexname},
+            $initial_index_size_stats->{page_count},
+            nice_size($initial_index_size_stats->{size}),
+            int($free_percent),
+            nice_size($free_space),
+            $reindex_time,
+            $locked_alter_attempt
+          );
+        return 1;
+        #~ $is_reindexed = (defined $is_reindexed) ? ($is_reindexed and 1) : 1;
+      } else {
+        logger(LOG_NOTICE, "Reindex%s: %s.%s, unable lock, delete index",
+          ($force ? " forced" : ""),
+          $schema_name,
+          $index_data->{indexname}
+        );
+        my $drop_index_time = time;
+        drop_temp_index($schema_name);
+        $reindex_time += time - $drop_index_time;
+        logger(LOG_WARNING, "Reindex%s: %s.%s, lock has not been acquired, initial size %d pages(%s)",#, can be reduced by %d%% (%s), duration %d seconds.",
+          ($force ? " forced" : ""),
+          $schema_name,
+          $index_data->{indexname},
+          $initial_index_size_stats->{page_count},
+          nice_size($initial_index_size_stats->{size}),
+          #$bloat_stats->{free_percent},
+          #nice_size($bloat_stats->{free_space}),
+          #$reindex_time
+        );
+        return 0;
+        #~ $is_reindexed = 0;
+      }
+}
+
 sub reindex_table {
   my $table_name = shift;
   my $schema_name = shift;
@@ -1014,6 +1153,11 @@ sub reindex_table {
   my $print_reindex_queries = shift;
 
   my $is_reindexed;
+
+  my $use_reindex_concurrently = ($_dbh_server_version >= 120000);
+  if ($reindex_replace) {
+      $use_reindex_concurrently = 0;
+  }
 
   my $index_data_list = get_index_data_list($schema_name, $table_name) || [];
 
@@ -1068,7 +1212,7 @@ sub reindex_table {
       }
     }
 
-    if (not $index_data->{'replace_index_possible'}) {
+    if (not $index_data->{'replace_index_possible'} and not $use_reindex_concurrently) {
       logger(LOG_NOTICE, "Skipping reindex: %s.%s, can not reindex without heavy locks because of its dependencies, reindexing is up to you.", $schema_name, $index_data->{indexname});
       logger(LOG_WARNING, "Reindex queries%s: %s.%s, initial size %d pages (%s), will be reduced by %d%% (%s)",
          ($force ? ' forced' : ''),
@@ -1086,97 +1230,13 @@ sub reindex_table {
     }
 
     if (!$no_reindex) {
-      my $start_reindex_time = time;
-      reindex($index_data);
-
-      if($DBI::err) {
-        logger(LOG_NOTICE, "Skipping index %s: %s", $index_data->{indexname}, $DBI::errstr);
-        drop_temp_index($schema_name);
-        next;
-      }
-
-      my $reindex_time = time - $start_reindex_time;
-
-      if ($index_data->{is_functional}) {
-        # perform auto analyze for functional indexes
-        my $analyze_time = time;
-        analyze($schema_name, $table_name);
-
-        if ($DBI::err) {
-          logger(LOG_ERROR, "Autoanalyze functional index error");
-          drop_temp_index($schema_name);
-          next;
-        }
-
-        $analyze_time = time - $analyze_time;
-        logger(LOG_NOTICE, "Autoanalyze functional index: duration %.3f second.", $analyze_time);
-      }
-
-      my $locked_alter_attempt = 0;
-      while ($locked_alter_attempt < $reindex_retry_max_count) {
-        unless(defined(alter_index($schema_name, $table_name, $index_data))) {
-          my $db_errstr = $DBI::errstr;
-
-          _dbh->do("END;");
-
-          if ($db_errstr && $db_errstr =~ 'canceling statement due to statement timeout') {
-            $locked_alter_attempt++;
-            logger(LOG_NOTICE, "Reindex%s: %s.%s, lock retry %d",
-              ($force ? " forced" : ""),
-              $schema_name,
-              $index_data->{indexname},
-              $locked_alter_attempt
-            );
-            if ($reindex_retry_pause) {
-                sleep($reindex_retry_pause);
-            }
-            next;
-          } else {
-            logger(LOG_ERROR, "SQL Error: %s", $db_errstr);
-            logger(LOG_ERROR, $@);
-            return;
-          }
-        };
-        $reindex_time = time - $start_reindex_time;
-        last;
-      }
-      if ($locked_alter_attempt < $reindex_retry_max_count) {
-          my $new_stats = get_index_size_statistics($schema_name, $index_data->{indexname});
-          my $free_percent = 100 * (1 - $new_stats->{size} / $initial_index_size_stats->{size});
-          my $free_space = ($initial_index_size_stats->{size} - $new_stats->{size});
-          logger(LOG_WARNING, "Reindex%s: %s.%s, initial size %d pages(%s), has been reduced by %d%% (%s), duration %d seconds, attempts %d.",
-            ($force ? " forced" : ""),
-            $schema_name,
-            $index_data->{indexname},
-            $initial_index_size_stats->{page_count},
-            nice_size($initial_index_size_stats->{size}),
-            int($free_percent),
-            nice_size($free_space),
-            $reindex_time,
-            $locked_alter_attempt
-          );
-        $is_reindexed = (defined $is_reindexed) ? ($is_reindexed and 1) : 1;
+      my $reindex_result;
+      if ($use_reindex_concurrently) {
+        $reindex_result = reindex_index_concurrently($index_data, $schema_name, $table_name, $initial_index_size_stats);
       } else {
-        logger(LOG_NOTICE, "Reindex%s: %s.%s, unable lock, delete index",
-          ($force ? " forced" : ""),
-          $schema_name,
-          $index_data->{indexname}
-        );
-        my $drop_index_time = time;
-        drop_temp_index($schema_name);
-        $reindex_time += time - $drop_index_time;
-        logger(LOG_WARNING, "Reindex%s: %s.%s, lock has not been acquired, initial size %d pages(%s)",#, can be reduced by %d%% (%s), duration %d seconds.",
-          ($force ? " forced" : ""),
-          $schema_name,
-          $index_data->{indexname},
-          $initial_index_size_stats->{page_count},
-          nice_size($initial_index_size_stats->{size}),
-          #$bloat_stats->{free_percent},
-          #nice_size($bloat_stats->{free_space}),
-          #$reindex_time
-        );
-        $is_reindexed = 0;
+        $reindex_result = reindex_index_old_replace($index_data, $schema_name, $table_name, $initial_index_size_stats);
       }
+      $is_reindexed = (defined $is_reindexed) ? ($is_reindexed and $reindex_result) : $reindex_result;
     }
 
     if ($print_reindex_queries) {
@@ -2001,6 +2061,10 @@ Perform an initial reindex of tables before processing.
 
 Print reindex queries. Useful if you want to perform manual
 reindex later.
+
+=item B<--reindex-replace>
+
+Avoid using REINDEX INDEX CONCURRENTLY even when it is available. By default this native PostgreSQL feature is preferred.
 
 =item B<--reindex-retry-count>
 
