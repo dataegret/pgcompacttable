@@ -810,8 +810,8 @@ FROM (
         'pg_catalog.pg_class'::regclass AS pgclassid
     FROM pg_catalog.pg_indexes
     WHERE
-        schemaname = quote_ident(?) AND
-        tablename = quote_ident(?)
+        schemaname = ? AND
+        tablename = ?
 ) AS sq
 LEFT JOIN pg_catalog.pg_constraint ON
     conindid = indexoid AND contype IN ('p', 'u', 'x')
