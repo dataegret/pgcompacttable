@@ -795,6 +795,7 @@ SELECT
     )::integer as is_functional,
     condeferrable as is_deferrable,
     condeferred as is_deferred,
+    (contype = 'x') as is_exclude_constraint,
     pg_catalog.pg_relation_size(indexoid) as idxsize
 FROM (
     SELECT
@@ -813,7 +814,7 @@ FROM (
         tablename = quote_ident(?)
 ) AS sq
 LEFT JOIN pg_catalog.pg_constraint ON
-    conindid = indexoid AND contype IN ('p', 'u')
+    conindid = indexoid AND contype IN ('p', 'u', 'x')
 ORDER BY idxsize
  ");
   
@@ -1031,6 +1032,11 @@ sub reindex_table {
 
     if ($initial_index_size_stats->{page_count} <= 1) {
       logger(LOG_NOTICE, "Skipping reindex: %s.%s, empty or 1 page index.", $schema_name, $index_data->{indexname});
+      next;
+    }
+
+    if ($index_data->{'is_exclude_constraint'}) {
+      logger(LOG_NOTICE, "Skipping reindex: %s.%s, can not reindex exclusion constraints", $schema_name, $index_data->{indexname});
       next;
     }
 
