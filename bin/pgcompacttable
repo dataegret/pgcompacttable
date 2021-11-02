@@ -1385,7 +1385,7 @@ sub process {
 
     if(!$force) {      
       if($table_info->{stats}{page_count} < MINIMAL_COMPACT_PAGES) {
-        logger(LOG_NOTICE,"Skipping processing: %d pages from %d pages minimum required.'", $table_info->{stats}{page_count}, MINIMAL_COMPACT_PAGES);
+        logger(LOG_NOTICE,"Skipping processing: %d pages from %d pages minimum required.", $table_info->{stats}{page_count}, MINIMAL_COMPACT_PAGES);
         $is_skipped = 1;
       }
       if(($bloat_stats->{free_percent}||0) <= MINIMAL_COMPACT_PERCENT) {
