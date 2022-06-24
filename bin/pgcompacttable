@@ -13,7 +13,7 @@ use DBI;
 
 use Data::Dumper;
 
-our $VERSION = '1.0.13';
+our $VERSION = '1.0.14';
 
 local $| = 1;
 select(STDOUT);
@@ -54,6 +54,8 @@ my $db_name = $ENV{LOGNAME} || $ENV{USER} || getpwuid($<);
 my $schema_name = 'public';
 my $table_name;
 my $table_names_like;
+my $table_size_min = 0;
+my $table_size_max = 0;
 
 my $verbose;
 my $quiet;
@@ -98,6 +100,8 @@ unless (GetOptions(
             'n|schema=s' => \$only_schema,
             't|table=s' => \$table_name,
             'tables-like=s' => \$table_names_like,
+            'min-table-size=i' => \$table_size_min,
+            'max-table-size=i' => \$table_size_max,
             'v|verbose' => \$verbose,
             'q|quiet' => \$quiet,
             'f|force' => \$force,
@@ -333,6 +337,14 @@ sub get_database_tables {
   my $extra_conditions = '';
   if ($table_names_like) {
     $extra_conditions .= " AND tablename LIKE " . _dbh->quote($table_names_like);
+  }
+  if ($table_size_min > 0) {
+      $extra_conditions .= " AND pg_catalog.pg_relation_size(
+        quote_ident(schemaname) || '.' || quote_ident(tablename)) >= " . ($table_size_min * 1024 * 1024);
+  }
+  if ($table_size_max > 0) {
+      $extra_conditions .= " AND pg_catalog.pg_relation_size(
+        quote_ident(schemaname) || '.' || quote_ident(tablename)) < " . ($table_size_max * 1024 * 1024);
   }
 
   my $sth = _dbh->prepare("
@@ -2034,6 +2046,14 @@ Condition to find tables to process by passing argument to SQL condition tablena
 =item B<--exclude-table> TABLE
 
 A table to exclude from processing.
+
+=item B<--min-table-size> SIZE
+
+Tables smaller than the specified size (in megabytes) will be excluded from processing
+
+=item B<--max-table-size> SIZE
+
+Tables larger than the specified size (in megabytes) will be excluded from processing
 
 =back
 
