@@ -85,6 +85,7 @@ my $initial_reindex;
 my $no_initial_vacuum;
 
 my %table_info;
+my $statement_timeout;
 
 unless (GetOptions(
             #help & man
@@ -119,7 +120,8 @@ unless (GetOptions(
             'a|all' => \$all_db,
             'N|exclude-schema=s' => \$exclude_schema,
             'T|exclude-table=s' => \$exclude_table,
-            'i|initial-reindex' => \$initial_reindex
+            'i|initial-reindex' => \$initial_reindex,
+            'statement_timeout=i' => \$statement_timeout
           )) {
  show_usage();
  exit(0);
@@ -1292,6 +1294,15 @@ sub process {
   if ($DBI::err) {
     logger(LOG_ERROR, "Table handling interrupt.");
     return -1;
+  }
+
+  if ($statement_timeout) {
+    my $sth0 = _dbh->do("set statement_timeout = $statement_timeout");
+    if ($DBI::err) {
+      logger(LOG_ERROR, "Set statement_timeout error.");
+      return -1;
+    }
+    logger(LOG_NOTICE, "Set statement_timeout = %d", $statement_timeout);
   }
 
   $table_info->{stats} = get_size_stats($schema_name, $table_name); 
