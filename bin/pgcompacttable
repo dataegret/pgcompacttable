@@ -2143,6 +2143,12 @@ A maximum number of retries in case of unsuccessful processing. By default 10.
 
 =back
 
+=item B<--statement_timeout> TIMEOUT
+
+Sets the maximum execution time for SQL operators (in milliseconds). By default, the timeout set for Postgres is used.
+
+=back
+
 =cut
 
 =head1 LICENSE AND COPYRIGHT
