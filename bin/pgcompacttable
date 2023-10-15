@@ -84,6 +84,8 @@ my %excluded_tables;
 my $initial_reindex;
 my $no_initial_vacuum;
 
+my $use_pgstattuple_approx;
+
 my %table_info;
 
 unless (GetOptions(
@@ -119,7 +121,8 @@ unless (GetOptions(
             'a|all' => \$all_db,
             'N|exclude-schema=s' => \$exclude_schema,
             'T|exclude-table=s' => \$exclude_table,
-            'i|initial-reindex' => \$initial_reindex
+            'i|initial-reindex' => \$initial_reindex,
+            'pgstattuple_approx' => \$use_pgstattuple_approx
           )) {
  show_usage();
  exit(0);
@@ -432,14 +435,17 @@ sub get_bloat_stats {
  
   my $pgstattuple_schema_name = get_pgstattuple_schema_name;
  
+  my $pgstattuplefunc = $use_pgstattuple_approx ? 'pgstattuple_approx' : 'pgstattuple';
+  my $free = $use_pgstattuple_approx ? 'approx_free' : 'free';
+
   return undef unless($pgstattuple_schema_name);
 
   my $sth = _dbh->prepare("SELECT
-    ceil((size - free_space - dead_tuple_len) * 100 / fillfactor / bs) AS effective_page_count,
+    ceil((size - ${free}_space - dead_tuple_len) * 100 / fillfactor / bs) AS effective_page_count,
             greatest(round(
-                (100 * (1 - (100 - free_percent - dead_tuple_percent) / fillfactor))::numeric, 2
+                (100 * (1 - (100 - ${free}_percent - dead_tuple_percent) / fillfactor))::numeric, 2
             ),0) AS free_percent,
-            greatest(ceil(size - (size - free_space - dead_tuple_len) * 100 / fillfactor), 0) AS free_space
+            greatest(ceil(size - (size - ${free}_space - dead_tuple_len) * 100 / fillfactor), 0) AS free_space
     FROM (
     SELECT
         current_setting('block_size')::integer AS bs,
@@ -453,7 +459,7 @@ sub get_bloat_stats {
         pgst.*
     FROM pg_catalog.pg_class
     CROSS JOIN
-        " . _dbh->quote_identifier($pgstattuple_schema_name) . ".pgstattuple(
+        " . _dbh->quote_identifier($pgstattuple_schema_name) . ".$pgstattuplefunc(
             (quote_ident(?) || '.' || quote_ident(?))) AS pgst
     WHERE pg_catalog.pg_class.oid = (quote_ident(?) || '.' || quote_ident(?))::regclass
     ) AS sq");
@@ -2129,6 +2135,10 @@ SQL statement to be called after each round against current database
 =item B<--max-retry-count> COUNT
 
 A maximum number of retries in case of unsuccessful processing. By default 10.
+
+=item B<--pgstattuple_approx>
+
+Use the function pgstattuple_approx instead of pgstattuple.
 
 =back
 
