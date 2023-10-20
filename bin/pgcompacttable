@@ -563,7 +563,7 @@ sub has_triggers {
   WHERE
       tgrelid = '$ident_name'::regclass AND
       tgenabled IN ('A', 'R') AND
-      (tgtype & 16)::boolean");
+      (tgtype::integer & 16)::boolean");
   $sth->execute;
 
   if ($DBI::err) {
